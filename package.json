@@ -15,12 +15,3 @@
     "node": ">=18.0.0"
   }
 }
-```
-
-7. **Click "Commit changes"**
-
----
-
-Render will auto-redeploy. Wait 1-2 minutes, then check the logs - you should see:
-```
-Email: ✅ Configured (Resend)
