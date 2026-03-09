@@ -1,0 +1,23 @@
+{
+  "name": "pool-authority-server",
+  "version": "1.0.0",
+  "description": "Pool Authority Payment Server with Stripe Integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.97.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "pdfjs-dist": "3.11.174",
+    "stripe": "^14.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
