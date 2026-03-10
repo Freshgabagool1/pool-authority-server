@@ -33,15 +33,57 @@ const paymentSessions = new Map();
 
 const categorizePool360Item = (description) => {
   const desc = description.toLowerCase();
-  const chemicalKeywords = ['shock','chlorine','chlor','acid','algaecide','antifreeze','ph ','alkalinity',
-    'stabilizer','sanitizer','oxidizer','calcium','cyanuric','bromine','stain','scale',
-    'clarifier','enzyme','phosphate','muriatic','soda ash','bicarb','dichlor','trichlor'];
-  const wearKeywords = ['plug','gasket','o-ring','basket','valve','lid','cover','guard',
+  const chemicalKeywords = [
+    'shock','chlorine','chlor','acid','algaecide','antifreeze','alkalinity',
+    'stabilizer','sanitizer','oxidizer','cyanuric','bromine','stain','scale',
+    'clarifier','enzyme','phosphate','muriatic','soda ash','bicarb','dichlor','trichlor',
+    'tablet','granular','liquid chlor','cal hypo','calcium hypo','sodium hypo',
+    'conditioner','sequestrant','de powder','diatomaceous','filter cleaner',
+    'tile cleaner','non-chlorine','quat','polyquat','sodium carbonate','dry acid',
+    'calcium chloride','hardness','balancer','ph up','ph down','ph+','ph-',
+    'oxidizing','salt','mineral','water balance','brightener','defoamer',
+    'spa chem','pool chem','algae',
+  ];
+  const wearKeywords = [
+    'plug','gasket','o-ring','oring','basket','valve','lid','cover','guard',
     'adapter','fitting','impeller','seal','diverter','skimmer','drain','cap','plate',
-    'flap','weir','eyeball','return'];
+    'flap','weir','eyeball','return fitting',
+    'cartridge','grid','lateral','standpipe','clamp','union','coupling','elbow',
+    'tee','hose','cleaner bag','sweep','tire','wheel','diaphragm','spring',
+    'bearing','gauge','pressure gauge','relief','motor','capacitor','diffuser',
+    'strainer','spider','faceplate','element','multiport','shaft seal',
+    'pump lid','pump basket','filter lid','check valve','drain plug',
+    'cell','salt cell','light gasket','lens gasket',
+  ];
+  const equipmentKeywords = [
+    'pump','filter','heater','heat pump','cleaner','automation','controller',
+    'blower','light','led','generator','feeder','robot','slide','ladder','rail',
+    'diving','board',
+  ];
   if (chemicalKeywords.some(k => desc.includes(k))) return 'chemical';
   if (wearKeywords.some(k => desc.includes(k))) return 'wear_item';
+  if (equipmentKeywords.some(k => desc.includes(k))) return 'equipment';
   return 'equipment';
+};
+
+const detectPool360Unit = (description, unitOfMeasure) => {
+  const desc = description.toUpperCase();
+  const weightMatch = desc.match(/(\d+)\s*LB/);
+  if (weightMatch) return { unit: 'lbs', conversionFactor: parseInt(weightMatch[1]) };
+  const multiGalMatch = desc.match(/(\d+)\s*X\s*(\d+\.?\d*)\s*GAL/);
+  if (multiGalMatch) return { unit: 'gal', conversionFactor: parseInt(multiGalMatch[1]) * parseFloat(multiGalMatch[2]) };
+  const galMatch = desc.match(/(\d+\.?\d*)\s*GAL/);
+  if (galMatch) return { unit: 'gal', conversionFactor: parseFloat(galMatch[1]) };
+  const multiQtMatch = desc.match(/(\d+)\s*X\s*(\d+)\s*QT/);
+  if (multiQtMatch) return { unit: 'oz', conversionFactor: parseInt(multiQtMatch[1]) * parseInt(multiQtMatch[2]) * 32 };
+  const qtMatch = desc.match(/(\d+)\s*QT/);
+  if (qtMatch) return { unit: 'oz', conversionFactor: parseInt(qtMatch[1]) * 32 };
+  const ozMatch = desc.match(/(\d+\.?\d*)\s*OZ/);
+  if (ozMatch) return { unit: 'oz', conversionFactor: parseFloat(ozMatch[1]) };
+  if (unitOfMeasure === 'GL') return { unit: 'gal', conversionFactor: 1 };
+  if (unitOfMeasure === 'BG' || unitOfMeasure === 'BK' || unitOfMeasure === 'PL') return { unit: 'lbs', conversionFactor: 1 };
+  if (unitOfMeasure === 'DZ') return { unit: 'each', conversionFactor: 12 };
+  return { unit: 'each', conversionFactor: 1 };
 };
 
 const parsePdfBuffer = async (buffer) => {
@@ -154,12 +196,13 @@ app.post('/api/process-pool360', async (req, res) => {
       const mapping = savedMappings[item.productCode];
       const itemType = mapping?.itemType || categorizePool360Item(item.description);
       const itemName = mapping?.itemName || item.description;
-      const conversionFactor = mapping?.conversionFactor || 1;
+      const autoUnit = detectPool360Unit(item.description, item.unitOfMeasure);
+      const conversionFactor = mapping?.conversionFactor || (itemType === 'chemical' ? autoUnit.conversionFactor : 1);
 
       if (itemType === 'chemical') {
         const actualQty = item.shippedQty * conversionFactor;
         const costPerUnit = conversionFactor > 1 ? item.unitPrice / conversionFactor : item.unitPrice;
-        const usageUnit = mapping?.usageUnit || 'lbs';
+        const usageUnit = mapping?.usageUnit || autoUnit.unit;
 
         const existing = (existingChemicals || []).find(c =>
           c.name.toLowerCase() === itemName.toLowerCase()
