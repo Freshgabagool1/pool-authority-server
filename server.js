@@ -92,6 +92,44 @@ const detectPool360Unit = (description, unitOfMeasure) => {
   return { unit: 'each', conversionFactor: 1 };
 };
 
+// Use product code middle number as category signal
+// Pool360 codes: PREFIX-MIDDLE-ITEM (e.g., PPG-50-1375)
+// Middle 50 = chemicals, 06/25 = parts, 10/20/45 = equipment
+const categorizeByProductCode = (productCode) => {
+  const middleMatch = productCode.match(/[A-Z]+-(\d+)-/);
+  if (!middleMatch) return null;
+  const mid = parseInt(middleMatch[1]);
+  if (mid === 50) return 'chemical';
+  if ([6, 25].includes(mid)) return 'wear_item';
+  if ([10, 20, 35, 45].includes(mid)) return 'equipment';
+  return null;
+};
+
+const buildPool360Item = (productCode, catalogInfo, description, uomMatch, savedMapping) => {
+  const fullText = (catalogInfo + ' ' + description).trim();
+  const codeType = categorizeByProductCode(productCode);
+  const autoType = savedMapping?.itemType || codeType || categorizePool360Item(fullText);
+  const autoUnit = detectPool360Unit(catalogInfo || description, uomMatch[1]);
+  return {
+    lineNum: parseInt(uomMatch.lineNum || 0),
+    productCode,
+    description: description || catalogInfo || `Product ${productCode}`,
+    catalogInfo: catalogInfo || '',
+    unitOfMeasure: uomMatch[1],
+    openQty: parseInt(uomMatch[2]),
+    orderedQty: parseInt(uomMatch[3]),
+    shippedQty: parseInt(uomMatch[4]),
+    backOrder: parseInt(uomMatch[5]),
+    unitPrice: parseFloat(uomMatch[6]),
+    totalPrice: parseFloat(uomMatch[7]),
+    itemName: savedMapping?.itemName || description || catalogInfo || `Product ${productCode}`,
+    itemType: autoType,
+    usageUnit: savedMapping?.usageUnit || (autoType === 'chemical' ? autoUnit.unit : 'each'),
+    conversionFactor: savedMapping?.conversionFactor || (autoType === 'chemical' ? autoUnit.conversionFactor : 1),
+    category: savedMapping?.category || '',
+  };
+};
+
 const parsePdfBuffer = async (buffer) => {
   const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
   const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
@@ -112,6 +150,10 @@ const parsePdfBuffer = async (buffer) => {
     });
   }
 
+  return { allRows };
+};
+
+const parsePool360Rows = (allRows, savedMappings) => {
   const items = [];
   for (let i = 0; i < allRows.length; i++) {
     const row = allRows[i];
@@ -119,6 +161,11 @@ const parsePdfBuffer = async (buffer) => {
     if (!productMatch) continue;
     const uomMatch = row.match(/(EA|CS|BX|BG|PL|BK|GL|DZ|CT)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)/);
     if (!uomMatch) continue;
+    // Extract catalog info: everything between product code and U/M code
+    const afterCode = row.substring(row.indexOf(productMatch[2]) + productMatch[2].length);
+    const beforeUom = afterCode.substring(0, afterCode.indexOf(uomMatch[1]));
+    const catalogInfo = beforeUom.trim();
+    // Description is on the next row(s)
     let description = '';
     for (let j = i + 1; j < Math.min(i + 3, allRows.length); j++) {
       const descRow = allRows[j].trim();
@@ -126,19 +173,9 @@ const parsePdfBuffer = async (buffer) => {
       description = descRow.replace(/\s+[A-Z]-\d{2}-[A-Z]\s*$/, '').trim();
       if (description) break;
     }
-    if (!description) description = `Product ${productMatch[2]}`;
-    items.push({
-      lineNum: parseInt(productMatch[1]),
-      productCode: productMatch[2],
-      description,
-      unitOfMeasure: uomMatch[1],
-      openQty: parseInt(uomMatch[2]),
-      orderedQty: parseInt(uomMatch[3]),
-      shippedQty: parseInt(uomMatch[4]),
-      backOrder: parseInt(uomMatch[5]),
-      unitPrice: parseFloat(uomMatch[6]),
-      totalPrice: parseFloat(uomMatch[7]),
-    });
+    const savedMapping = savedMappings?.[productMatch[2]];
+    uomMatch.lineNum = productMatch[1];
+    items.push(buildPool360Item(productMatch[2], catalogInfo, description, uomMatch, savedMapping));
   }
   return items;
 };
@@ -175,14 +212,17 @@ app.post('/api/process-pool360', async (req, res) => {
 
     // Parse the PDF
     const pdfBuffer = Buffer.from(pdfBase64, 'base64');
-    const parsedItems = await parsePdfBuffer(pdfBuffer);
+    const { allRows } = await parsePdfBuffer(pdfBuffer);
+
+    // Load saved mappings
+    const savedMappings = org.settings?.pool360Mappings || {};
+
+    // Parse rows with catalog info extraction and product code categorization
+    const parsedItems = parsePool360Rows(allRows, savedMappings);
 
     if (parsedItems.length === 0) {
       return res.json({ success: true, message: 'No line items found in PDF', imported: { chemicals: 0, wearItems: 0 } });
     }
-
-    // Load saved mappings
-    const savedMappings = org.settings?.pool360Mappings || {};
 
     // Categorize and import
     let chemCount = 0, wearCount = 0;
@@ -199,16 +239,14 @@ app.post('/api/process-pool360', async (req, res) => {
       .eq('org_id', orgId);
 
     for (const item of parsedItems) {
-      const mapping = savedMappings[item.productCode];
-      const itemType = mapping?.itemType || categorizePool360Item(item.description);
-      const itemName = mapping?.itemName || item.description;
-      const autoUnit = detectPool360Unit(item.description, item.unitOfMeasure);
-      const conversionFactor = mapping?.conversionFactor || (itemType === 'chemical' ? autoUnit.conversionFactor : 1);
+      const itemType = item.itemType;
+      const itemName = item.itemName;
+      const conversionFactor = item.conversionFactor;
 
       if (itemType === 'chemical') {
         const actualQty = item.shippedQty * conversionFactor;
         const costPerUnit = conversionFactor > 1 ? item.unitPrice / conversionFactor : item.unitPrice;
-        const usageUnit = mapping?.usageUnit || autoUnit.unit;
+        const usageUnit = item.usageUnit;
 
         const existing = (existingChemicals || []).find(c =>
           c.name.toLowerCase() === itemName.toLowerCase()
@@ -223,7 +261,7 @@ app.post('/api/process-pool360', async (req, res) => {
           await supabase.from('chemical_inventory').insert({
             org_id: orgId,
             name: itemName,
-            category: mapping?.category || '',
+            category: item.category || '',
             quantity: actualQty,
             unit: usageUnit,
             cost_per_unit: costPerUnit,
