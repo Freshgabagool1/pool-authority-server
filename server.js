@@ -1,10 +1,11 @@
-// Pool Authority - Stripe Payment Server + Pool360 Auto-Import
-// This server handles secure Stripe payment processing and Pool360 invoice imports
+// Pool Authority - Stripe Payment Server + Pool360 Auto-Import + Email
+// This server handles secure Stripe payment processing, Pool360 invoice imports, and email sending
 
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const nodemailer = require('nodemailer');
 
 const app = express();
 
@@ -26,6 +27,92 @@ app.use(express.json({ limit: '10mb' }));
 
 // Store for payment sessions (in production, use a real database)
 const paymentSessions = new Map();
+
+// ============================================================
+// Email Setup (Gmail SMTP via Nodemailer)
+// ============================================================
+
+const gmailUser = process.env.GMAIL_USER;
+const gmailAppPassword = process.env.GMAIL_APP_PASSWORD;
+const gmailFrom = process.env.GMAIL_FROM || gmailUser;
+
+let emailTransporter = null;
+if (gmailUser && gmailAppPassword) {
+  emailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: gmailUser,
+      pass: gmailAppPassword,
+    },
+  });
+  // Verify connection on startup
+  emailTransporter.verify().then(() => {
+    console.log('Gmail SMTP connected successfully');
+  }).catch((err) => {
+    console.error('Gmail SMTP connection failed:', err.message);
+  });
+}
+
+// Process email template: replace {{variable}} placeholders and handle {{#if var}}...{{/if}} blocks
+const processTemplate = (template, data) => {
+  if (!template) return '';
+  let result = template;
+  // Handle {{#if var}}...{{/if}} blocks
+  result = result.replace(/\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g, (match, varName, content) => {
+    return data[varName] ? content : '';
+  });
+  // Replace {{variable}} placeholders
+  for (const [key, value] of Object.entries(data)) {
+    result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value || '');
+  }
+  return result;
+};
+
+// Convert markdown-style text to HTML for email
+const textToHtml = (text) => {
+  if (!text) return '';
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br>')
+    .replace(/• /g, '&bull; ');
+};
+
+// Build a styled HTML email wrapper
+const buildEmailHtml = (bodyContent, companySettings) => {
+  const companyName = companySettings?.companyName || 'Pool Authority';
+  const companyPhone = companySettings?.phone || '';
+  const companyEmail = companySettings?.email || gmailFrom;
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+<div style="max-width:600px;margin:20px auto;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
+  <div style="background:#1e3a5f;padding:20px 24px;text-align:center;">
+    <h1 style="color:#ffffff;margin:0;font-size:22px;">${companyName}</h1>
+  </div>
+  <div style="padding:24px;color:#333;line-height:1.6;font-size:15px;">
+    ${bodyContent}
+  </div>
+  <div style="background:#f8f9fa;padding:16px 24px;text-align:center;color:#888;font-size:12px;border-top:1px solid #eee;">
+    ${companyName}${companyPhone ? ' | ' + companyPhone : ''}${companyEmail ? ' | ' + companyEmail : ''}
+  </div>
+</div>
+</body></html>`;
+};
+
+// Send email helper
+const sendEmail = async (to, subject, htmlBody, from) => {
+  if (!emailTransporter) {
+    throw new Error('Email not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD environment variables.');
+  }
+  const mailOptions = {
+    from: `"${from || gmailFrom}" <${gmailFrom}>`,
+    to,
+    subject,
+    html: htmlBody,
+  };
+  const result = await emailTransporter.sendMail(mailOptions);
+  return result;
+};
 
 // ============================================================
 // Pool360 Auto-Import Helpers
@@ -302,12 +389,107 @@ app.post('/api/process-pool360', async (req, res) => {
   }
 });
 
+// ============================================================
+// Email Endpoints
+// ============================================================
+
+// POST /api/send-email — Generic email (used for contracts, water test results)
+app.post('/api/send-email', async (req, res) => {
+  try {
+    const { to, subject, html, from } = req.body;
+    if (!to || !subject || !html) {
+      return res.status(400).json({ error: 'Missing required fields: to, subject, html' });
+    }
+    await sendEmail(to, subject, html, from);
+    res.json({ success: true, message: `Email sent to ${to}` });
+  } catch (error) {
+    console.error('Send email error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /send-invoice — Monthly invoice & payment reminder emails
+app.post('/send-invoice', async (req, res) => {
+  try {
+    const { to, template, data, companySettings, paymentLink } = req.body;
+    if (!to || !template) {
+      return res.status(400).json({ error: 'Missing required fields: to, template' });
+    }
+
+    const companyName = companySettings?.companyName || 'Pool Authority';
+    const allData = { ...data, company_name: companyName };
+    const subject = processTemplate(template.subject, allData);
+    let body = processTemplate(template.body, allData);
+
+    // Add payment link button if provided
+    if (paymentLink) {
+      body += `\n\n**Pay Online:**\n[Click here to pay securely](${paymentLink})`;
+    }
+
+    const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
+    await sendEmail(to, subject, htmlBody);
+    res.json({ success: true, message: `Invoice email sent to ${to}` });
+  } catch (error) {
+    console.error('Send invoice error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /send-weekly-update — Weekly service updates, job confirmations, job completions
+app.post('/send-weekly-update', async (req, res) => {
+  try {
+    const { to, template, data, companySettings, paymentLink } = req.body;
+    if (!to || !template) {
+      return res.status(400).json({ error: 'Missing required fields: to, template' });
+    }
+
+    const companyName = companySettings?.companyName || 'Pool Authority';
+    const allData = { ...data, company_name: companyName };
+    const subject = processTemplate(template.subject, allData);
+    let body = processTemplate(template.body, allData);
+
+    if (paymentLink) {
+      body += `\n\n**Pay Online:**\n[Click here to pay securely](${paymentLink})`;
+    }
+
+    const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
+    await sendEmail(to, subject, htmlBody);
+    res.json({ success: true, message: `Email sent to ${to}` });
+  } catch (error) {
+    console.error('Send weekly update error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /send-quote — Quote emails
+app.post('/send-quote', async (req, res) => {
+  try {
+    const { to, template, data, companySettings } = req.body;
+    if (!to || !template) {
+      return res.status(400).json({ error: 'Missing required fields: to, template' });
+    }
+
+    const companyName = companySettings?.companyName || 'Pool Authority';
+    const allData = { ...data, company_name: companyName };
+    const subject = processTemplate(template.subject, allData);
+    const body = processTemplate(template.body, allData);
+
+    const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
+    await sendEmail(to, subject, htmlBody);
+    res.json({ success: true, message: `Quote email sent to ${to}` });
+  } catch (error) {
+    console.error('Send quote error:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'Pool Authority Payment Server Running',
-    version: '1.1.0',
+    version: '1.2.0',
     stripe: 'connected',
+    email: emailTransporter ? 'configured' : 'not configured',
     pool360Import: supabase ? 'enabled' : 'disabled'
   });
 });
@@ -535,9 +717,14 @@ Endpoints:
 - POST /api/webhook - Stripe webhook handler
 - GET  /api/payments - List all payments
 - POST /api/process-pool360 - Auto-import Pool360 PDF
+- POST /api/send-email - Send generic HTML email
+- POST /send-invoice - Send invoice/payment reminder
+- POST /send-weekly-update - Send service update/job emails
+- POST /send-quote - Send quote email
 
 Pool360 Import: ${supabase ? 'Enabled' : 'Disabled (set SUPABASE_SERVICE_ROLE_KEY)'}
-Ready to accept payments!
+Email: ${emailTransporter ? 'Configured (' + gmailFrom + ')' : 'Not configured (set GMAIL_USER + GMAIL_APP_PASSWORD)'}
+Ready!
   `);
 });
 
