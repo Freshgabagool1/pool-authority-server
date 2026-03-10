@@ -12,7 +12,7 @@ const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Supabase client with service role key (for auto-import writes)
-const supabaseUrl = process.env.SUPABASE_URL || 'https://okuafgwmkgsplvxaikbj.supabase.co';
+const supabaseUrl = process.env.SUPABASE_URL || 'https://visqepsesgcarjcnvvbx.supabase.co';
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const supabase = supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : null;
 
