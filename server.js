@@ -1,6 +1,9 @@
 // Pool Authority - Stripe Payment Server + Pool360 Auto-Import + Email
 // This server handles secure Stripe payment processing, Pool360 invoice imports, and email sending
 
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
@@ -52,13 +55,6 @@ if (gmailUser && gmailAppPassword) {
     pool: true,
     maxConnections: 3,
     tls: { rejectUnauthorized: false },
-    dnsLookup: (hostname, options, callback) => {
-      const dns = require('dns');
-      dns.resolve4(hostname, (err, addresses) => {
-        if (err) return callback(err);
-        callback(null, addresses[0], 4);
-      });
-    },
   });
   // Verify connection on startup
   emailTransporter.verify().then(() => {
