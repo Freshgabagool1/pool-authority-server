@@ -253,12 +253,13 @@ app.post('/api/process-pool360', async (req, res) => {
         );
 
         if (existing) {
+          existing.quantity = (existing.quantity || 0) + actualQty;
           await supabase.from('chemical_inventory').update({
-            quantity: existing.quantity + actualQty,
+            quantity: existing.quantity,
             cost_per_unit: costPerUnit,
           }).eq('id', existing.id);
         } else {
-          await supabase.from('chemical_inventory').insert({
+          const { data: inserted } = await supabase.from('chemical_inventory').insert({
             org_id: orgId,
             name: itemName,
             category: item.category || '',
@@ -266,7 +267,9 @@ app.post('/api/process-pool360', async (req, res) => {
             unit: usageUnit,
             cost_per_unit: costPerUnit,
             supplier: 'Pool360/SCP',
-          });
+          }).select().single();
+          // Track newly inserted item so same-named items later in this loop don't duplicate
+          if (inserted) existingChemicals.push(inserted);
         }
         chemCount++;
       } else {
@@ -274,12 +277,13 @@ app.post('/api/process-pool360', async (req, res) => {
           w.name.toLowerCase() === itemName.toLowerCase()
         );
         if (!exists) {
-          await supabase.from('wear_items').insert({
+          const { data: insertedWear } = await supabase.from('wear_items').insert({
             org_id: orgId,
             name: itemName,
             price: item.unitPrice,
             description: `Pool360: ${item.productCode}`,
-          });
+          }).select().single();
+          if (insertedWear) existingWearItems.push(insertedWear);
           wearCount++;
         }
       }
