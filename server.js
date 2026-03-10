@@ -32,43 +32,48 @@ const paymentSessions = new Map();
 // ============================================================
 
 const categorizePool360Item = (description) => {
-  const desc = description.toLowerCase();
+  const desc = (' ' + description.toLowerCase() + ' ');
   const chemicalKeywords = [
     'shock','chlorine','chlor','acid','algaecide','antifreeze','alkalinity',
-    'stabilizer','sanitizer','oxidizer','cyanuric','bromine','stain','scale',
+    'stabilizer','sanitizer','oxidizer','cyanuric','bromine','stain & scale',
     'clarifier','enzyme','phosphate','muriatic','soda ash','bicarb','dichlor','trichlor',
-    'tablet','granular','liquid chlor','cal hypo','calcium hypo','sodium hypo',
+    'tablet','tablets','tabs','granular','liquid chlor','cal hypo','cal-hypo',
+    'calcium hypo','sodium hypo','hypochlorite',
     'conditioner','sequestrant','de powder','diatomaceous','filter cleaner',
     'tile cleaner','non-chlorine','quat','polyquat','sodium carbonate','dry acid',
     'calcium chloride','hardness','balancer','ph up','ph down','ph+','ph-',
-    'oxidizing','salt','mineral','water balance','brightener','defoamer',
-    'spa chem','pool chem','algae',
+    'oxidizing','mineral','water balance','brightener','defoamer',
+    'spa chem','pool chem','algae','shock-it','super shock',
+    'chlorinating','sanitize','3 in ','3" ','1 in ','1" ',
   ];
+  if (chemicalKeywords.some(k => desc.includes(k))) return 'chemical';
   const wearKeywords = [
     'plug','gasket','o-ring','oring','basket','valve','lid','cover','guard',
-    'adapter','fitting','impeller','seal','diverter','skimmer','drain','cap','plate',
+    'adapter','fitting','impeller','diverter','skimmer','drain plug',
     'flap','weir','eyeball','return fitting',
-    'cartridge','grid','lateral','standpipe','clamp','union','coupling','elbow',
-    'tee','hose','cleaner bag','sweep','tire','wheel','diaphragm','spring',
-    'bearing','gauge','pressure gauge','relief','motor','capacitor','diffuser',
-    'strainer','spider','faceplate','element','multiport','shaft seal',
-    'pump lid','pump basket','filter lid','check valve','drain plug',
-    'cell','salt cell','light gasket','lens gasket',
+    'cartridge','lateral','standpipe','clamp','union','coupling','elbow',
+    'cleaner bag','sweep','tire','wheel','diaphragm','spring',
+    'bearing','pressure gauge','air relief','motor','capacitor','diffuser',
+    'strainer','spider gasket','faceplate','multiport','shaft seal',
+    'pump lid','pump basket','filter lid','check valve',
+    'salt cell','light gasket','lens gasket','grid set','grid element',
+    'drain cap','end cap','hose section',
   ];
+  if (wearKeywords.some(k => desc.includes(k))) return 'wear_item';
   const equipmentKeywords = [
     'pump','filter','heater','heat pump','cleaner','automation','controller',
     'blower','light','led','generator','feeder','robot','slide','ladder','rail',
     'diving','board',
   ];
-  if (chemicalKeywords.some(k => desc.includes(k))) return 'chemical';
-  if (wearKeywords.some(k => desc.includes(k))) return 'wear_item';
   if (equipmentKeywords.some(k => desc.includes(k))) return 'equipment';
   return 'equipment';
 };
 
 const detectPool360Unit = (description, unitOfMeasure) => {
   const desc = description.toUpperCase();
-  const weightMatch = desc.match(/(\d+)\s*LB/);
+  const multiLbMatch = desc.match(/(\d+)\s*X\s*(\d+\.?\d*)\s*(?:LB|#)/);
+  if (multiLbMatch) return { unit: 'lbs', conversionFactor: parseInt(multiLbMatch[1]) * parseFloat(multiLbMatch[2]) };
+  const weightMatch = desc.match(/(\d+)\s*(?:LB|#)/);
   if (weightMatch) return { unit: 'lbs', conversionFactor: parseInt(weightMatch[1]) };
   const multiGalMatch = desc.match(/(\d+)\s*X\s*(\d+\.?\d*)\s*GAL/);
   if (multiGalMatch) return { unit: 'gal', conversionFactor: parseInt(multiGalMatch[1]) * parseFloat(multiGalMatch[2]) };
@@ -83,6 +88,7 @@ const detectPool360Unit = (description, unitOfMeasure) => {
   if (unitOfMeasure === 'GL') return { unit: 'gal', conversionFactor: 1 };
   if (unitOfMeasure === 'BG' || unitOfMeasure === 'BK' || unitOfMeasure === 'PL') return { unit: 'lbs', conversionFactor: 1 };
   if (unitOfMeasure === 'DZ') return { unit: 'each', conversionFactor: 12 };
+  if (unitOfMeasure === 'CS') return { unit: 'each', conversionFactor: 1 };
   return { unit: 'each', conversionFactor: 1 };
 };
 
