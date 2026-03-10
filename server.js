@@ -1,14 +1,10 @@
 // Pool Authority - Stripe Payment Server + Pool360 Auto-Import + Email
 // This server handles secure Stripe payment processing, Pool360 invoice imports, and email sending
 
-const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
-
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
-const nodemailer = require('nodemailer');
 
 const app = express();
 
@@ -32,37 +28,11 @@ app.use(express.json({ limit: '10mb' }));
 const paymentSessions = new Map();
 
 // ============================================================
-// Email Setup (Gmail SMTP via Nodemailer)
+// Email Setup (Resend HTTP API — SMTP blocked on Render)
 // ============================================================
 
-const gmailUser = process.env.GMAIL_USER;
-const gmailAppPassword = process.env.GMAIL_APP_PASSWORD;
-const gmailFrom = process.env.GMAIL_FROM || gmailUser;
-
-let emailTransporter = null;
-if (gmailUser && gmailAppPassword) {
-  emailTransporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,
-    auth: {
-      user: gmailUser,
-      pass: gmailAppPassword,
-    },
-    connectionTimeout: 30000,
-    greetingTimeout: 15000,
-    socketTimeout: 30000,
-    pool: true,
-    maxConnections: 3,
-    tls: { rejectUnauthorized: false },
-  });
-  // Verify connection on startup
-  emailTransporter.verify().then(() => {
-    console.log('Gmail SMTP connected successfully');
-  }).catch((err) => {
-    console.error('Gmail SMTP connection failed:', err.message);
-  });
-}
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM = process.env.EMAIL_FROM || 'onboarding@resend.dev';
 
 // Process email template: replace {{variable}} placeholders and handle {{#if var}}...{{/if}} blocks
 const processTemplate = (template, data) => {
@@ -92,7 +62,7 @@ const textToHtml = (text) => {
 const buildEmailHtml = (bodyContent, companySettings) => {
   const companyName = companySettings?.companyName || 'Pool Authority';
   const companyPhone = companySettings?.phone || '';
-  const companyEmail = companySettings?.email || gmailFrom;
+  const companyEmail = companySettings?.email || EMAIL_FROM;
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
@@ -110,18 +80,29 @@ const buildEmailHtml = (bodyContent, companySettings) => {
 </body></html>`;
 };
 
-// Send email helper
-const sendEmail = async (to, subject, htmlBody, from) => {
-  if (!emailTransporter) {
-    throw new Error('Email not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD environment variables.');
+// Send email via Resend HTTP API
+const sendEmail = async (to, subject, htmlBody, fromName) => {
+  if (!RESEND_API_KEY) {
+    throw new Error('Email not configured. Set RESEND_API_KEY environment variable.');
   }
-  const mailOptions = {
-    from: `"${from || gmailFrom}" <${gmailFrom}>`,
-    to,
-    subject,
-    html: htmlBody,
-  };
-  const result = await emailTransporter.sendMail(mailOptions);
+  const fromAddress = fromName ? `${fromName} <${EMAIL_FROM}>` : EMAIL_FROM;
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: fromAddress,
+      to: [to],
+      subject,
+      html: htmlBody,
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.message || result.error || 'Resend API error');
+  }
   return result;
 };
 
@@ -438,7 +419,7 @@ app.post('/send-invoice', async (req, res) => {
     }
 
     const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
-    await sendEmail(to, subject, htmlBody);
+    await sendEmail(to, subject, htmlBody, companyName);
     res.json({ success: true, message: `Invoice email sent to ${to}` });
   } catch (error) {
     console.error('Send invoice error:', error.message);
@@ -464,7 +445,7 @@ app.post('/send-weekly-update', async (req, res) => {
     }
 
     const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
-    await sendEmail(to, subject, htmlBody);
+    await sendEmail(to, subject, htmlBody, companyName);
     res.json({ success: true, message: `Email sent to ${to}` });
   } catch (error) {
     console.error('Send weekly update error:', error.message);
@@ -486,7 +467,7 @@ app.post('/send-quote', async (req, res) => {
     const body = processTemplate(template.body, allData);
 
     const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
-    await sendEmail(to, subject, htmlBody);
+    await sendEmail(to, subject, htmlBody, companyName);
     res.json({ success: true, message: `Quote email sent to ${to}` });
   } catch (error) {
     console.error('Send quote error:', error.message);
@@ -500,7 +481,7 @@ app.get('/', (req, res) => {
     status: 'Pool Authority Payment Server Running',
     version: '1.2.0',
     stripe: 'connected',
-    email: emailTransporter ? 'configured' : 'not configured',
+    email: RESEND_API_KEY ? 'configured' : 'not configured',
     pool360Import: supabase ? 'enabled' : 'disabled'
   });
 });
@@ -734,7 +715,7 @@ Endpoints:
 - POST /send-quote - Send quote email
 
 Pool360 Import: ${supabase ? 'Enabled' : 'Disabled (set SUPABASE_SERVICE_ROLE_KEY)'}
-Email: ${emailTransporter ? 'Configured (' + gmailFrom + ')' : 'Not configured (set GMAIL_USER + GMAIL_APP_PASSWORD)'}
+Email: ${RESEND_API_KEY ? 'Configured (Resend - ' + EMAIL_FROM + ')' : 'Not configured (set RESEND_API_KEY + EMAIL_FROM)'}
 Ready!
   `);
 });
