@@ -28,11 +28,34 @@ app.use(express.json({ limit: '10mb' }));
 const paymentSessions = new Map();
 
 // ============================================================
-// Email Setup (Resend HTTP API — SMTP blocked on Render)
+// Email Setup (Gmail SMTP via Nodemailer)
 // ============================================================
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const EMAIL_FROM = process.env.EMAIL_FROM || 'onboarding@resend.dev';
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const GMAIL_FROM = process.env.GMAIL_FROM || GMAIL_USER;
+
+let emailTransporter = null;
+if (GMAIL_USER && GMAIL_APP_PASSWORD) {
+  const nodemailer = require('nodemailer');
+  emailTransporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: {
+      user: GMAIL_USER,
+      pass: GMAIL_APP_PASSWORD,
+    },
+    connectionTimeout: 30000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
+  });
+  emailTransporter.verify().then(() => {
+    console.log('Gmail SMTP connected successfully as', GMAIL_FROM);
+  }).catch((err) => {
+    console.error('Gmail SMTP connection failed:', err.message);
+  });
+}
 
 // Process email template: replace {{variable}} placeholders and handle {{#if var}}...{{/if}} blocks
 const processTemplate = (template, data) => {
@@ -62,7 +85,7 @@ const textToHtml = (text) => {
 const buildEmailHtml = (bodyContent, companySettings) => {
   const companyName = companySettings?.companyName || 'Pool Authority';
   const companyPhone = companySettings?.phone || '';
-  const companyEmail = companySettings?.email || EMAIL_FROM;
+  const companyEmail = companySettings?.email || GMAIL_FROM;
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
@@ -80,29 +103,17 @@ const buildEmailHtml = (bodyContent, companySettings) => {
 </body></html>`;
 };
 
-// Send email via Resend HTTP API
+// Send email helper
 const sendEmail = async (to, subject, htmlBody, fromName) => {
-  if (!RESEND_API_KEY) {
-    throw new Error('Email not configured. Set RESEND_API_KEY environment variable.');
+  if (!emailTransporter) {
+    throw new Error('Email not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD environment variables.');
   }
-  const fromAddress = fromName ? `${fromName} <${EMAIL_FROM}>` : EMAIL_FROM;
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: fromAddress,
-      to: [to],
-      subject,
-      html: htmlBody,
-    }),
+  const result = await emailTransporter.sendMail({
+    from: fromName ? `"${fromName}" <${GMAIL_FROM}>` : GMAIL_FROM,
+    to,
+    subject,
+    html: htmlBody,
   });
-  const result = await response.json();
-  if (!response.ok) {
-    throw new Error(result.message || result.error || 'Resend API error');
-  }
   return result;
 };
 
@@ -481,7 +492,7 @@ app.get('/', (req, res) => {
     status: 'Pool Authority Payment Server Running',
     version: '1.2.0',
     stripe: 'connected',
-    email: RESEND_API_KEY ? 'configured' : 'not configured',
+    email: emailTransporter ? 'configured' : 'not configured',
     pool360Import: supabase ? 'enabled' : 'disabled'
   });
 });
@@ -715,7 +726,7 @@ Endpoints:
 - POST /send-quote - Send quote email
 
 Pool360 Import: ${supabase ? 'Enabled' : 'Disabled (set SUPABASE_SERVICE_ROLE_KEY)'}
-Email: ${RESEND_API_KEY ? 'Configured (Resend - ' + EMAIL_FROM + ')' : 'Not configured (set RESEND_API_KEY + EMAIL_FROM)'}
+Email: ${emailTransporter ? 'Configured (' + GMAIL_FROM + ')' : 'Not configured (set GMAIL_USER + GMAIL_APP_PASSWORD)'}
 Ready!
   `);
 });
