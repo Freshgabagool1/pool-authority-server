@@ -39,11 +39,18 @@ const gmailFrom = process.env.GMAIL_FROM || gmailUser;
 let emailTransporter = null;
 if (gmailUser && gmailAppPassword) {
   emailTransporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
     auth: {
       user: gmailUser,
       pass: gmailAppPassword,
     },
+    connectionTimeout: 30000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
+    pool: true,
+    maxConnections: 3,
   });
   // Verify connection on startup
   emailTransporter.verify().then(() => {
