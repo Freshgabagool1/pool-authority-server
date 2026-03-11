@@ -93,18 +93,22 @@ const buildEmailHtml = (bodyContent, companySettings) => {
 };
 
 // Send email via Resend HTTP API
-const sendEmail = async (to, subject, htmlBody, fromName) => {
+const sendEmail = async (to, subject, htmlBody, fromName, attachments) => {
   if (!RESEND_API_KEY) {
     throw new Error('Email not configured. Set RESEND_API_KEY environment variable on Render.');
   }
   const from = fromName ? `${fromName} <${EMAIL_FROM.replace(/^.*</, '').replace(/>$/, '') || EMAIL_FROM}>` : EMAIL_FROM;
+  const payload = { from, to: [to], subject, html: htmlBody };
+  if (attachments && attachments.length > 0) {
+    payload.attachments = attachments;
+  }
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${RESEND_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ from, to: [to], subject, html: htmlBody }),
+    body: JSON.stringify(payload),
   });
   const result = await response.json();
   if (!response.ok) {
@@ -410,7 +414,7 @@ app.post('/api/send-email', async (req, res) => {
 // POST /send-invoice — Monthly invoice & payment reminder emails
 app.post('/send-invoice', async (req, res) => {
   try {
-    const { to, template, data, companySettings, paymentLink } = req.body;
+    const { to, template, data, companySettings, paymentLink, attachment } = req.body;
     if (!to || !template) {
       return res.status(400).json({ error: 'Missing required fields: to, template' });
     }
@@ -426,7 +430,8 @@ app.post('/send-invoice', async (req, res) => {
     }
 
     const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
-    await sendEmail(to, subject, htmlBody, companyName);
+    const attachments = attachment ? [{ filename: attachment.filename, content: attachment.content }] : undefined;
+    await sendEmail(to, subject, htmlBody, companyName, attachments);
     res.json({ success: true, message: `Invoice email sent to ${to}` });
   } catch (error) {
     console.error('Send invoice error:', error.message);
@@ -464,7 +469,7 @@ app.post('/send-weekly-update', async (req, res) => {
 // POST /send-quote — Quote emails
 app.post('/send-quote', async (req, res) => {
   try {
-    const { to, template, data, companySettings } = req.body;
+    const { to, template, data, companySettings, attachment } = req.body;
     if (!to || !template) {
       return res.status(400).json({ error: 'Missing required fields: to, template' });
     }
@@ -475,7 +480,8 @@ app.post('/send-quote', async (req, res) => {
     const body = processTemplate(template.body, allData);
 
     const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
-    await sendEmail(to, subject, htmlBody, companyName);
+    const attachments = attachment ? [{ filename: attachment.filename, content: attachment.content }] : undefined;
+    await sendEmail(to, subject, htmlBody, companyName, attachments);
     res.json({ success: true, message: `Quote email sent to ${to}` });
   } catch (error) {
     console.error('Send quote error:', error.message);
