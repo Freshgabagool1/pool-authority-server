@@ -58,6 +58,18 @@ const textToHtml = (text) => {
     .replace(/• /g, '&bull; ');
 };
 
+// Build photo HTML for embedding in emails
+const buildPhotosHtml = (photoUrls) => {
+  if (!photoUrls || !Array.isArray(photoUrls) || photoUrls.length === 0) return '';
+  const images = photoUrls.map(url =>
+    `<img src="${url}" alt="Service photo" style="width:100%;max-width:560px;height:auto;border-radius:8px;display:block;" />`
+  ).join('<div style="height:12px;"></div>');
+  return `<div style="margin-top:20px;padding-top:16px;border-top:1px solid #eee;">
+    <h3 style="margin:0 0 12px 0;color:#1e3a5f;font-size:16px;">Service Photos</h3>
+    ${images}
+  </div>`;
+};
+
 // Build a styled HTML email wrapper
 const buildEmailHtml = (bodyContent, companySettings) => {
   const companyName = companySettings?.companyName || 'Pool Authority';
@@ -439,7 +451,8 @@ app.post('/send-weekly-update', async (req, res) => {
       body += `\n\n**Pay Online:**\n[Click here to pay securely](${paymentLink})`;
     }
 
-    const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
+    const bodyHtml = textToHtml(body) + buildPhotosHtml(data?.photo_urls);
+    const htmlBody = buildEmailHtml(bodyHtml, companySettings);
     await sendEmail(to, subject, htmlBody, companyName);
     res.json({ success: true, message: `Email sent to ${to}` });
   } catch (error) {
