@@ -178,7 +178,16 @@ const detectPool360Unit = (description, unitOfMeasure) => {
   if (unitOfMeasure === 'GL') return { unit: 'gal', conversionFactor: 1 };
   if (unitOfMeasure === 'BG' || unitOfMeasure === 'BK' || unitOfMeasure === 'PL') return { unit: 'lbs', conversionFactor: 1 };
   if (unitOfMeasure === 'DZ') return { unit: 'each', conversionFactor: 12 };
-  if (unitOfMeasure === 'CS') return { unit: 'each', conversionFactor: 1 };
+  // For cases/boxes/packs, try to detect pack count from description
+  if (unitOfMeasure === 'CS' || unitOfMeasure === 'BX' || unitOfMeasure === 'PK') {
+    const packMatch = desc.match(/(\d+)\s*(?:PK|PACK|COUNT|CT|PCS?)\b/);
+    if (packMatch) return { unit: 'each', conversionFactor: parseInt(packMatch[1]) };
+    const perMatch = desc.match(/(\d+)\s*(?:\/|PER)\s*(?:CS|CASE|BX|BOX)\b/);
+    if (perMatch) return { unit: 'each', conversionFactor: parseInt(perMatch[1]) };
+    const cntMatch = desc.match(/(\d+)\s*X\s*(\d+)(?:\s|$)/);
+    if (cntMatch) return { unit: 'each', conversionFactor: parseInt(cntMatch[1]) * parseInt(cntMatch[2]) };
+    return { unit: 'each', conversionFactor: 1 };
+  }
   return { unit: 'each', conversionFactor: 1 };
 };
 
@@ -227,17 +236,32 @@ const parsePdfBuffer = async (buffer) => {
   for (let i = 1; i <= doc.numPages; i++) {
     const page = await doc.getPage(i);
     const content = await page.getTextContent();
-    const yMap = {};
-    content.items.forEach(item => {
-      const y = Math.round(item.transform[5]);
-      if (!yMap[y]) yMap[y] = [];
-      yMap[y].push({ str: item.str, x: item.transform[4] });
-    });
-    const sortedYs = Object.keys(yMap).map(Number).sort((a, b) => b - a);
-    sortedYs.forEach(y => {
-      const row = yMap[y].sort((a, b) => a.x - b.x).map(it => it.str).join(' ').trim();
-      if (row) allRows.push(row);
-    });
+
+    // Collect text items with positions, skip empties
+    const textItems = content.items
+      .filter(item => item.str.trim())
+      .map(item => ({ str: item.str, x: item.transform[4], y: item.transform[5] }));
+
+    // Sort by Y descending (top of page first)
+    textItems.sort((a, b) => b.y - a.y);
+
+    // Group into rows with 3-point Y tolerance (fixes items split across Y-coords)
+    let groupItems = [];
+    let groupY = null;
+    for (const item of textItems) {
+      if (groupY !== null && Math.abs(item.y - groupY) > 3) {
+        const text = groupItems.sort((a, b) => a.x - b.x).map(it => it.str).join(' ').trim();
+        if (text) allRows.push(text);
+        groupItems = [];
+        groupY = null;
+      }
+      groupItems.push(item);
+      if (groupY === null) groupY = item.y;
+    }
+    if (groupItems.length > 0) {
+      const text = groupItems.sort((a, b) => a.x - b.x).map(it => it.str).join(' ').trim();
+      if (text) allRows.push(text);
+    }
   }
 
   return { allRows };
@@ -245,27 +269,70 @@ const parsePdfBuffer = async (buffer) => {
 
 const parsePool360Rows = (allRows, savedMappings) => {
   const items = [];
+  // Flexible product code: line# then PREFIX-DIGITS-DIGITS
+  const productRe = /(\d+)\s+([A-Z][A-Z0-9]*-\d+-\d+)/;
+  // Expanded UOM codes
+  const uomCodes = 'EA|CS|BX|BG|PL|BK|GL|DZ|CT|RL|PR|ST|PK|JR|DR|TB|BT|CN|PC|SF|LF|HD|KT';
+  // Primary: UOM + open + ordered + shipped + backorder + unitPrice + totalPrice
+  const uomRe = new RegExp(`(${uomCodes})\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+([\\d.]+)\\s+([\\d.]+)`);
+  // Fallback: UOM + ordered + shipped + unitPrice + totalPrice (open/backorder omitted)
+  const uomFallback = new RegExp(`(${uomCodes})\\s+(\\d+)\\s+(\\d+)\\s+([\\d.]+)\\s+([\\d.]+)`);
+
   for (let i = 0; i < allRows.length; i++) {
     const row = allRows[i];
-    const productMatch = row.match(/(\d+)\s+([A-Z]{2,4}-\d{2,3}-\d{4})/);
+    const productMatch = row.match(productRe);
     if (!productMatch) continue;
-    const uomMatch = row.match(/(EA|CS|BX|BG|PL|BK|GL|DZ|CT)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)/);
+
+    // Try UOM on same row first
+    let uomMatch = row.match(uomRe);
+    let uomRow = row;
+    let skipNext = false;
+
+    // If not found, try combining with next row (PDF may split across Y-coords)
+    if (!uomMatch && i + 1 < allRows.length) {
+      const combined = row + ' ' + allRows[i + 1];
+      uomMatch = combined.match(uomRe);
+      if (uomMatch) { uomRow = combined; skipNext = true; }
+    }
+
+    // Fallback: fewer quantity columns
+    if (!uomMatch) {
+      const fb = row.match(uomFallback);
+      if (fb) {
+        uomMatch = [fb[0], fb[1], '0', fb[2], fb[3], '0', fb[4], fb[5]];
+        uomRow = row;
+      }
+    }
+    if (!uomMatch && i + 1 < allRows.length) {
+      const combined = row + ' ' + allRows[i + 1];
+      const fb = combined.match(uomFallback);
+      if (fb) {
+        uomMatch = [fb[0], fb[1], '0', fb[2], fb[3], '0', fb[4], fb[5]];
+        uomRow = combined; skipNext = true;
+      }
+    }
+
     if (!uomMatch) continue;
-    // Extract catalog info: everything between product code and U/M code
-    const afterCode = row.substring(row.indexOf(productMatch[2]) + productMatch[2].length);
-    const beforeUom = afterCode.substring(0, afterCode.indexOf(uomMatch[1]));
-    const catalogInfo = beforeUom.trim();
-    // Description is on the next row(s)
+
+    // Extract catalog info: text between product code and UOM code
+    const codeEnd = uomRow.indexOf(productMatch[2]) + productMatch[2].length;
+    const uomStart = uomRow.indexOf(uomMatch[1], codeEnd);
+    const catalogInfo = (uomStart > codeEnd) ? uomRow.substring(codeEnd, uomStart).trim() : '';
+
+    // Description from subsequent row(s)
     let description = '';
-    for (let j = i + 1; j < Math.min(i + 3, allRows.length); j++) {
+    const descStart = skipNext ? i + 2 : i + 1;
+    for (let j = descStart; j < Math.min(descStart + 3, allRows.length); j++) {
       const descRow = allRows[j].trim();
-      if (!descRow || descRow.match(/^\d+\s+[A-Z]{2,4}-\d{2,3}-\d{4}/)) break;
+      if (!descRow || descRow.match(productRe)) break;
       description = descRow.replace(/\s+[A-Z]-\d{2}-[A-Z]\s*$/, '').trim();
       if (description) break;
     }
+
     const savedMapping = savedMappings?.[productMatch[2]];
     uomMatch.lineNum = productMatch[1];
     items.push(buildPool360Item(productMatch[2], catalogInfo, description, uomMatch, savedMapping));
+    if (skipNext) i++;
   }
   return items;
 };
@@ -311,7 +378,9 @@ app.post('/api/process-pool360', async (req, res) => {
     const parsedItems = parsePool360Rows(allRows, savedMappings);
 
     if (parsedItems.length === 0) {
-      return res.json({ success: true, message: 'No line items found in PDF', imported: { chemicals: 0, wearItems: 0 } });
+      console.log(`Pool360: extracted ${allRows.length} text rows but found 0 line items`);
+      if (allRows.length > 0) console.log('Pool360 first 5 rows:', allRows.slice(0, 5));
+      return res.json({ success: true, message: `No line items found in PDF (${allRows.length} text rows extracted)`, imported: { chemicals: 0, wearItems: 0 }, debugRowCount: allRows.length });
     }
 
     // Categorize and import
