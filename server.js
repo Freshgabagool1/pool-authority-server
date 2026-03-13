@@ -208,7 +208,7 @@ const buildPool360Item = (productCode, catalogInfo, description, uomMatch, saved
   const fullText = (catalogInfo + ' ' + description).trim();
   const codeType = categorizeByProductCode(productCode);
   const autoType = savedMapping?.itemType || codeType || categorizePool360Item(fullText);
-  const autoUnit = detectPool360Unit(catalogInfo || description, uomMatch[1]);
+  const autoUnit = detectPool360Unit(fullText, uomMatch[1]);
   return {
     lineNum: parseInt(uomMatch.lineNum || 0),
     productCode,
@@ -432,19 +432,25 @@ app.post('/api/process-pool360', async (req, res) => {
         }
         chemCount++;
       } else {
-        const exists = (existingWearItems || []).some(w =>
+        const existingWear = (existingWearItems || []).find(w =>
           w.name.toLowerCase() === itemName.toLowerCase()
         );
-        if (!exists) {
+        if (existingWear) {
+          // Update existing wear item with latest price
+          await supabase.from('wear_items').update({
+            price: item.unitPrice,
+            description: `Pool360: ${item.productCode} | Last order: ${item.shippedQty} units`,
+          }).eq('id', existingWear.id);
+        } else {
           const { data: insertedWear } = await supabase.from('wear_items').insert({
             org_id: orgId,
             name: itemName,
             price: item.unitPrice,
-            description: `Pool360: ${item.productCode}`,
+            description: `Pool360: ${item.productCode} | Qty: ${item.shippedQty}`,
           }).select().single();
           if (insertedWear) existingWearItems.push(insertedWear);
-          wearCount++;
         }
+        wearCount++;
       }
     }
 
