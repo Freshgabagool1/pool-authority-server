@@ -1,0 +1,52 @@
+[
+  {
+    "content": "Pentair IntelliFlo VSF pump making grinding or screeching noise. Common causes: 1) Worn bearings - the pump motor bearings wear over time, especially if the pump runs dry or overheats. Replace the motor or bearing assembly. 2) Debris in impeller - small rocks, acorns, or debris can get lodged between the impeller and diffuser. Remove the pump housing and clear debris. 3) Cavitation - pump is starving for water due to clogged skimmer baskets, closed valves, or air leak on suction side. Check all suction-side connections and baskets.",
+    "source_type": "troubleshooting",
+    "manufacturer": "pentair",
+    "equipment": "pump",
+    "model_name": "IntelliFlo VSF",
+    "tags": ["noise", "grinding", "bearings", "impeller", "cavitation"],
+    "source_title": "Pentair IntelliFlo Troubleshooting Guide",
+    "source_url": "https://www.pentair.com/content/dam/extranet/nam/pentair-pool/residential/manuals/intelliflo-vsf.pdf"
+  },
+  {
+    "content": "Hayward DE filter pressure reading above 10 PSI over clean starting pressure indicates filter needs backwashing. If pressure remains high after backwash: 1) DE grids may be torn or damaged - open filter and inspect each grid. 2) Manifold may be cracked allowing DE powder to bypass grids. 3) Internal air bleeder may be clogged. 4) If filter was reassembled recently, check that belly band clamp is properly seated and grids are correctly positioned on the manifold.",
+    "source_type": "troubleshooting",
+    "manufacturer": "hayward",
+    "equipment": "filter",
+    "model_name": "DE6020",
+    "tags": ["pressure", "backwash", "de-grids", "manifold"],
+    "source_title": "Hayward Pro-Grid DE Filter Manual",
+    "source_url": ""
+  },
+  {
+    "content": "Salt chlorinator showing 'Check Salt' or 'Low Salt' error. Test actual salt level with independent test strip or meter before troubleshooting. If salt level is actually fine (2700-3400 ppm): 1) Clean the salt cell - soak in 4:1 water to muriatic acid solution for 5-10 minutes. 2) Check flow sensor - make sure enough water is flowing through the cell. 3) Inspect cell for calcium buildup on the plates. 4) If cell is more than 5 years old, it may need replacement. Cell life is typically 3-7 years depending on usage and water chemistry.",
+    "source_type": "troubleshooting",
+    "manufacturer": "hayward",
+    "equipment": "chlorinator",
+    "model_name": "AquaRite",
+    "tags": ["salt", "error-code", "cell-cleaning", "calcium"],
+    "source_title": "Salt Chlorinator Diagnostics - Field Notes",
+    "source_url": ""
+  },
+  {
+    "content": "Pool water is green but chlorine reads high on test kit. This is likely a false high chlorine reading caused by very high combined chlorine (chloramines). The DPD test can bleach out and show clear/high when chlorine is actually depleted. Solution: 1) Use FAS-DPD drop test for accurate reading. 2) The pool likely needs a shock treatment of 30 ppm+ to reach breakpoint chlorination. 3) Run pump 24/7 during treatment. 4) Brush walls and floor. 5) Backwash filter frequently during recovery. Recovery typically takes 2-4 days depending on severity.",
+    "source_type": "guide",
+    "manufacturer": null,
+    "equipment": null,
+    "model_name": null,
+    "tags": ["green-water", "algae", "chlorine", "chemistry", "shock"],
+    "source_title": "Trouble Free Pool - Green Pool Recovery",
+    "source_url": "https://www.troublefreepool.com/blog/2019/01/18/green-pool/"
+  },
+  {
+    "content": "Raypak 406A heater not igniting. Diagnostic sequence: 1) Check that thermostat is calling for heat (set desired temp above water temp). 2) Verify gas supply - is gas valve open? Other gas appliances working? 3) Listen for igniter clicking - if no click, check ignition module and wiring. 4) If igniter clicks but no flame, check gas pressure at manifold, inspect burner tray for debris/rust/spider webs (common!). 5) Check high limit switches haven't tripped - press reset button. 6) Inspect pressure switch and bypass if testing (do not leave bypassed). 7) Check for error codes on digital display if equipped.",
+    "source_type": "troubleshooting",
+    "manufacturer": "raypak",
+    "equipment": "heater",
+    "model_name": "406A",
+    "tags": ["no-heat", "ignition", "gas", "error-code", "pressure-switch"],
+    "source_title": "Raypak 406A Service Manual",
+    "source_url": ""
+  }
+]

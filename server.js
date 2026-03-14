@@ -1,10 +1,14 @@
-// Pool Authority - Stripe Payment Server + Pool360 Auto-Import + Email
-// This server handles secure Stripe payment processing, Pool360 invoice imports, and email sending
+// Pool Authority - Stripe Payment Server + Pool360 Auto-Import + Email + AI Tech Assist
+// This server handles secure Stripe payment processing, Pool360 invoice imports, email sending, and AI diagnostics
 
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const multer = require('multer');
+const sharp = require('sharp');
+const Anthropic = require('@anthropic-ai/sdk').default || require('@anthropic-ai/sdk');
+const OpenAI = require('openai').default || require('openai');
 
 const app = express();
 
@@ -504,6 +508,224 @@ app.post('/api/process-pool360', async (req, res) => {
 });
 
 // ============================================================
+// AI Tech Diagnostic Assistant (RAG)
+// ============================================================
+
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const EMBEDDING_MODEL = 'text-embedding-3-small';
+const MAX_CONTEXT_CHUNKS = 5;
+const MAX_IMAGE_DIMENSION = 1568;
+const SIMILARITY_THRESHOLD = 0.3;
+
+// Initialize AI clients (lazy — only if env vars are set)
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+// Multer for image uploads (in-memory, max 10MB)
+const techAssistUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    cb(null, allowed.includes(file.mimetype));
+  },
+});
+
+const TECH_ASSIST_SYSTEM_PROMPT = `You are the Pool Authority AI Diagnostic Assistant, built for professional pool service technicians in the field.
+
+ROLE: You help techs diagnose and fix pool equipment problems using your knowledge base of equipment manuals, troubleshooting guides, and field experience.
+
+GUIDELINES:
+- Be direct and practical — techs are standing in front of the equipment right now
+- Lead with the most likely cause and fix, then list alternatives
+- If an image is provided, analyze it closely for visible damage, wear, error codes, model numbers, or unusual conditions
+- Reference specific part numbers when you can
+- Always mention safety considerations (electrical, gas, chemical)
+- If you identify the equipment make/model from the image, say so
+- If you're not confident in a diagnosis, say so clearly — don't guess on safety-critical items
+- Use plain language, not marketing speak
+- If the issue is beyond field repair, say so and recommend what to tell the customer
+
+FORMAT:
+- Start with your assessment (1-2 sentences)
+- Then give step-by-step diagnostic/repair instructions
+- End with "If that doesn't resolve it:" and list next steps
+
+KNOWLEDGE CONTEXT:
+The following are relevant excerpts from our knowledge base. Use them to ground your response, but also apply general pool service knowledge:
+
+{context}`;
+
+async function getQueryEmbedding(text) {
+  const response = await openai.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: text,
+  });
+  return response.data[0].embedding;
+}
+
+async function searchKnowledge(embedding, filters = {}) {
+  const { data, error } = await supabase.rpc('match_knowledge', {
+    query_embedding: embedding,
+    match_count: MAX_CONTEXT_CHUNKS,
+    match_threshold: SIMILARITY_THRESHOLD,
+    filter_manufacturer: filters.manufacturer || null,
+    filter_equipment: filters.equipment || null,
+    filter_source_type: filters.source_type || null,
+  });
+  if (error) {
+    console.error('Knowledge search error:', error);
+    return [];
+  }
+  return data || [];
+}
+
+async function processImage(imageBuffer) {
+  const image = sharp(imageBuffer);
+  const metadata = await image.metadata();
+  let processed = image;
+  if (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) {
+    processed = image.resize(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION, {
+      fit: 'inside',
+      withoutEnlargement: true,
+    });
+  }
+  const buffer = await processed.jpeg({ quality: 85 }).toBuffer();
+  return {
+    type: 'image',
+    source: {
+      type: 'base64',
+      media_type: 'image/jpeg',
+      data: buffer.toString('base64'),
+    },
+  };
+}
+
+function formatContext(chunks) {
+  if (chunks.length === 0) {
+    return 'No specific matches found in the knowledge base. Use your general pool service expertise.';
+  }
+  return chunks
+    .map((chunk, i) => {
+      const source = [chunk.source_title, chunk.manufacturer, chunk.model_name]
+        .filter(Boolean).join(' — ');
+      return `--- Source ${i + 1}: ${source} (${Math.round(chunk.similarity * 100)}% match) ---\n${chunk.content}`;
+    })
+    .join('\n\n');
+}
+
+// POST /api/tech-assist — Main diagnostic endpoint
+app.post('/api/tech-assist', techAssistUpload.single('image'), async (req, res) => {
+  try {
+    if (!anthropic || !openai) {
+      return res.status(500).json({ error: 'AI not configured. Set ANTHROPIC_API_KEY and OPENAI_API_KEY.' });
+    }
+    if (!supabase) {
+      return res.status(500).json({ error: 'Supabase not configured.' });
+    }
+
+    const { question, manufacturer, equipment, conversation_history } = req.body;
+    if (!question || question.trim().length === 0) {
+      return res.status(400).json({ error: 'Question is required' });
+    }
+
+    // 1. Generate embedding for the question
+    const embedding = await getQueryEmbedding(question);
+
+    // 2. Search knowledge base
+    const knowledgeChunks = await searchKnowledge(embedding, {
+      manufacturer: manufacturer || null,
+      equipment: equipment || null,
+    });
+
+    // 3. Build context
+    const contextStr = formatContext(knowledgeChunks);
+    const systemPrompt = TECH_ASSIST_SYSTEM_PROMPT.replace('{context}', contextStr);
+
+    // 4. Build message content (text + optional image)
+    const userContent = [];
+    if (req.file) {
+      const imageContent = await processImage(req.file.buffer);
+      userContent.push(imageContent);
+    }
+    userContent.push({ type: 'text', text: question });
+
+    // 5. Build messages array (support multi-turn conversation)
+    const messages = [];
+    if (conversation_history) {
+      try {
+        const history = JSON.parse(conversation_history);
+        messages.push(...history);
+      } catch (e) { /* ignore malformed history */ }
+    }
+    messages.push({ role: 'user', content: userContent });
+
+    // 6. Call Claude
+    const response = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 2048,
+      system: systemPrompt,
+      messages: messages,
+    });
+
+    const assistantMessage = response.content
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('\n');
+
+    // 7. Log the diagnostic session (async, don't block response)
+    supabase
+      .from('diagnostic_sessions')
+      .insert({
+        question: question,
+        has_image: !!req.file,
+        response: assistantMessage,
+        knowledge_ids: knowledgeChunks.map(c => c.id),
+        equipment_tag: equipment || null,
+      })
+      .then(({ error }) => {
+        if (error) console.error('Failed to log diagnostic session:', error);
+      });
+
+    // 8. Return response
+    res.json({
+      response: assistantMessage,
+      sources: knowledgeChunks.map(c => ({
+        title: c.source_title,
+        manufacturer: c.manufacturer,
+        equipment: c.equipment,
+        model: c.model_name,
+        similarity: Math.round(c.similarity * 100),
+      })),
+      usage: {
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+      },
+    });
+
+  } catch (error) {
+    console.error('Tech assist error:', error);
+    res.status(500).json({ error: 'Diagnostic assistant error', message: error.message });
+  }
+});
+
+// POST /api/tech-assist/rate — Rate a diagnostic session
+app.post('/api/tech-assist/rate', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { session_id, rating, resolved } = req.body;
+    const { error } = await supabase
+      .from('diagnostic_sessions')
+      .update({ rating, resolved })
+      .eq('id', session_id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
 // Email Endpoints
 // ============================================================
 
@@ -604,10 +826,11 @@ app.post('/send-quote', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     status: 'Pool Authority Payment Server Running',
-    version: '1.2.0',
+    version: '1.3.0',
     stripe: 'connected',
     email: RESEND_API_KEY ? 'configured' : 'not configured',
-    pool360Import: supabase ? 'enabled' : 'disabled'
+    pool360Import: supabase ? 'enabled' : 'disabled',
+    techAssist: (anthropic && openai) ? 'enabled' : 'disabled (set ANTHROPIC_API_KEY + OPENAI_API_KEY)'
   });
 });
 
@@ -834,6 +1057,8 @@ Endpoints:
 - POST /api/webhook - Stripe webhook handler
 - GET  /api/payments - List all payments
 - POST /api/process-pool360 - Auto-import Pool360 PDF
+- POST /api/tech-assist - AI diagnostic assistant
+- POST /api/tech-assist/rate - Rate diagnostic session
 - POST /api/send-email - Send generic HTML email
 - POST /send-invoice - Send invoice/payment reminder
 - POST /send-weekly-update - Send service update/job emails
@@ -841,6 +1066,7 @@ Endpoints:
 
 Pool360 Import: ${supabase ? 'Enabled' : 'Disabled (set SUPABASE_SERVICE_ROLE_KEY)'}
 Email: ${RESEND_API_KEY ? 'Configured (Resend)' : 'Not configured (set RESEND_API_KEY)'}
+AI Tech Assist: ${(anthropic && openai) ? 'Enabled' : 'Disabled (set ANTHROPIC_API_KEY + OPENAI_API_KEY)'}
 Ready!
   `);
 });
