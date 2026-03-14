@@ -725,6 +725,199 @@ app.post('/api/tech-assist/rate', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Knowledge Base PDF Upload — POST /api/knowledge/upload-pdf
+// ---------------------------------------------------------------------------
+const CHUNK_SIZE = 1500;
+const CHUNK_OVERLAP = 200;
+const EMBED_BATCH_SIZE = 50;
+
+function chunkText(text, maxLength = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+  if (text.length <= maxLength) return [text];
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = start + maxLength;
+    if (end < text.length) {
+      const lastPeriod = text.lastIndexOf('.', end);
+      const lastNewline = text.lastIndexOf('\n', end);
+      const breakPoint = Math.max(lastPeriod, lastNewline);
+      if (breakPoint > start + maxLength * 0.5) end = breakPoint + 1;
+    }
+    chunks.push(text.slice(start, end).trim());
+    start = end - overlap;
+  }
+  return chunks.filter(c => c.length > 50); // Skip tiny chunks
+}
+
+function detectManufacturer(text) {
+  const t = text.toLowerCase();
+  const brands = [
+    { key: 'pentair', patterns: ['pentair', 'intelliflo', 'intellichlor', 'intellicenter', 'mastertemp', 'superflow', 'whisperflo', 'easytouch', 'screenlogic'] },
+    { key: 'hayward', patterns: ['hayward', 'aquarite', 'aqua rite', 'pro-grid', 'progrid', 'super pump', 'tristar', 'ecostar', 'omnilogic', 'swimpure'] },
+    { key: 'jandy', patterns: ['jandy', 'zodiac', 'aqualink', 'stealth', 'flopro', 'laars', 'polaris'] },
+    { key: 'raypak', patterns: ['raypak'] },
+    { key: 'sta-rite', patterns: ['sta-rite', 'starite', 'max-e-therm', 'intellipro'] },
+    { key: 'polaris', patterns: ['polaris'] },
+    { key: 'waterway', patterns: ['waterway'] },
+    { key: 'jacuzzi', patterns: ['jacuzzi'] },
+  ];
+  for (const brand of brands) {
+    if (brand.patterns.some(p => t.includes(p))) return brand.key;
+  }
+  return null;
+}
+
+function detectEquipment(text) {
+  const t = text.toLowerCase();
+  const types = [
+    { key: 'pump', patterns: ['pump', 'impeller', 'motor', 'priming', 'suction', 'gpm', 'flow rate'] },
+    { key: 'filter', patterns: ['filter', 'cartridge', 'de grid', 'backwash', 'sand filter', 'multiport'] },
+    { key: 'heater', patterns: ['heater', 'heat pump', 'burner', 'ignit', 'btu', 'thermostat', 'pilot', 'gas valve'] },
+    { key: 'chlorinator', patterns: ['chlorinator', 'salt cell', 'salt chlor', 'aquarite', 'intellichlor', 'swg', 'salt water'] },
+    { key: 'automation', patterns: ['automation', 'controller', 'aqualink', 'easytouch', 'intellicenter', 'omnilogic', 'screenlogic'] },
+    { key: 'cleaner', patterns: ['cleaner', 'sweep', 'polaris', 'robot', 'suction cleaner', 'pressure cleaner'] },
+    { key: 'light', patterns: ['pool light', 'spa light', 'led light', 'fiber optic', 'nicheless'] },
+  ];
+  for (const type of types) {
+    if (type.patterns.some(p => t.includes(p))) return type.key;
+  }
+  return null;
+}
+
+function detectTags(text) {
+  const t = text.toLowerCase();
+  const tagMap = {
+    'error-code': ['error code', 'fault code', 'diagnostic code', 'e0', 'err'],
+    'noise': ['noise', 'grinding', 'screeching', 'humming', 'vibrat'],
+    'leak': ['leak', 'drip', 'seep', 'water loss'],
+    'prime': ['prime', 'priming', 'air lock', 'lost prime'],
+    'pressure': ['pressure', 'psi', 'high pressure', 'low pressure'],
+    'wiring': ['wiring', 'wire', 'electrical', 'voltage', 'amp'],
+    'installation': ['install', 'setup', 'plumb', 'mounting'],
+    'maintenance': ['maintenance', 'service', 'clean', 'inspect'],
+    'chemistry': ['chemistry', 'chlorine', 'ph', 'alkalinity', 'calcium', 'cya'],
+  };
+  const tags = [];
+  for (const [tag, patterns] of Object.entries(tagMap)) {
+    if (patterns.some(p => t.includes(p))) tags.push(tag);
+  }
+  return tags;
+}
+
+// Multer for PDF uploads (in-memory, max 25MB)
+const pdfUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    cb(null, file.mimetype === 'application/pdf');
+  },
+});
+
+app.post('/api/knowledge/upload-pdf', pdfUpload.single('pdf'), async (req, res) => {
+  try {
+    if (!openai) return res.status(500).json({ error: 'OpenAI not configured (set OPENAI_API_KEY)' });
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+
+    const { source_title, manufacturer: manualMfg, equipment: manualEquip, source_type } = req.body || {};
+
+    // 1. Extract text from PDF
+    const { allRows } = await parsePdfBuffer(req.file.buffer);
+    const fullText = allRows.join('\n');
+
+    if (fullText.length < 100) {
+      return res.status(400).json({ error: 'PDF appears to have very little text. It may be a scanned image — only text-based PDFs are supported.' });
+    }
+
+    // 2. Auto-detect metadata from content
+    const detectedMfg = manualMfg || detectManufacturer(fullText);
+    const detectedEquip = manualEquip || detectEquipment(fullText);
+    const tags = detectTags(fullText);
+    const title = source_title || req.file.originalname.replace('.pdf', '');
+
+    // 3. Chunk the text
+    const chunks = chunkText(fullText);
+
+    // 4. Generate embeddings in batches
+    const allEmbeddings = [];
+    for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
+      const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
+      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: batch });
+      allEmbeddings.push(...response.data.map(item => item.embedding));
+      if (i + EMBED_BATCH_SIZE < chunks.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    // 5. Insert into knowledge_base
+    const insertRows = chunks.map((chunk, i) => ({
+      content: chunk,
+      embedding: allEmbeddings[i],
+      source_type: source_type || 'manual',
+      manufacturer: detectedMfg,
+      equipment: detectedEquip,
+      model_name: null,
+      tags: tags,
+      source_title: title,
+      source_url: null,
+      metadata: { filename: req.file.originalname, pages: Math.ceil(fullText.length / 3000) },
+    }));
+
+    let inserted = 0;
+    for (let i = 0; i < insertRows.length; i += 100) {
+      const batch = insertRows.slice(i, i + 100);
+      const { error } = await supabase.from('knowledge_base').insert(batch);
+      if (error) {
+        console.error('KB insert error:', error.message);
+        continue;
+      }
+      inserted += batch.length;
+    }
+
+    res.json({
+      success: true,
+      message: `Ingested "${title}" — ${inserted} chunks from ${allRows.length} text rows`,
+      details: {
+        chunks: inserted,
+        manufacturer: detectedMfg,
+        equipment: detectedEquip,
+        tags: tags,
+        textLength: fullText.length,
+      },
+    });
+
+  } catch (error) {
+    console.error('PDF knowledge upload error:', error);
+    res.status(500).json({ error: 'Failed to process PDF', message: error.message });
+  }
+});
+
+// GET /api/knowledge/stats — Get knowledge base stats
+app.get('/api/knowledge/stats', async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    const { data, error } = await supabase
+      .from('knowledge_base')
+      .select('id, source_title, manufacturer, equipment, source_type, created_at');
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Group by source_title
+    const sources = {};
+    for (const row of (data || [])) {
+      const key = row.source_title || 'Unknown';
+      if (!sources[key]) {
+        sources[key] = { title: key, chunks: 0, manufacturer: row.manufacturer, equipment: row.equipment, source_type: row.source_type, created_at: row.created_at };
+      }
+      sources[key].chunks++;
+    }
+
+    res.json({ total_chunks: (data || []).length, sources: Object.values(sources) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============================================================
 // Email Endpoints
 // ============================================================
@@ -1059,6 +1252,8 @@ Endpoints:
 - POST /api/process-pool360 - Auto-import Pool360 PDF
 - POST /api/tech-assist - AI diagnostic assistant
 - POST /api/tech-assist/rate - Rate diagnostic session
+- POST /api/knowledge/upload-pdf - Upload PDF to knowledge base
+- GET  /api/knowledge/stats - Knowledge base stats
 - POST /api/send-email - Send generic HTML email
 - POST /send-invoice - Send invoice/payment reminder
 - POST /send-weekly-update - Send service update/job emails
