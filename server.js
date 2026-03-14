@@ -123,20 +123,7 @@ const sendEmail = async (to, subject, htmlBody, fromName, attachments) => {
 
 const categorizePool360Item = (description) => {
   const desc = (' ' + description.toLowerCase() + ' ');
-  const chemicalKeywords = [
-    'shock','chlorine','chlor','acid','algaecide','antifreeze','alkalinity',
-    'stabilizer','sanitizer','oxidizer','cyanuric','bromine','stain & scale',
-    'clarifier','enzyme','phosphate','muriatic','soda ash','bicarb','dichlor','trichlor',
-    'tablet','tablets','tabs','granular','liquid chlor','cal hypo','cal-hypo',
-    'calcium hypo','sodium hypo','hypochlorite',
-    'conditioner','sequestrant','de powder','diatomaceous','filter cleaner',
-    'tile cleaner','non-chlorine','quat','polyquat','sodium carbonate','dry acid',
-    'calcium chloride','hardness','balancer','ph up','ph down','ph+','ph-',
-    'oxidizing','mineral','water balance','brightener','defoamer',
-    'spa chem','pool chem','algae','shock-it','super shock',
-    'chlorinating','sanitize','3 in ','3" ','1 in ','1" ',
-  ];
-  if (chemicalKeywords.some(k => desc.includes(k))) return 'chemical';
+  // Wear items first — replacement parts (check before equipment since 'filter' overlaps)
   const wearKeywords = [
     'plug','gasket','o-ring','oring','basket','valve','lid','cover','guard',
     'adapter','fitting','impeller','diverter','skimmer','drain plug',
@@ -150,13 +137,15 @@ const categorizePool360Item = (description) => {
     'drain cap','end cap','hose section',
   ];
   if (wearKeywords.some(k => desc.includes(k))) return 'wear_item';
+  // Equipment — capital items
   const equipmentKeywords = [
     'pump','filter','heater','heat pump','cleaner','automation','controller',
     'blower','light','led','generator','feeder','robot','slide','ladder','rail',
     'diving','board',
   ];
   if (equipmentKeywords.some(k => desc.includes(k))) return 'equipment';
-  return 'equipment';
+  // Default to chemical — pool supply orders are mostly chemicals/consumables
+  return 'chemical';
 };
 
 const detectPool360Unit = (description, unitOfMeasure) => {
@@ -397,6 +386,21 @@ app.post('/api/process-pool360', async (req, res) => {
       return res.json({ success: true, message: `No line items found in PDF (${allRows.length} text rows extracted)`, imported: { chemicals: 0, wearItems: 0 }, debugRowCount: allRows.length });
     }
 
+    // Date gate: only auto-import orders from 2026 onwards
+    // Look for date patterns in the raw text rows (e.g., "01/15/2026", "2026-01-15", "Jan 15, 2026")
+    let orderYear = null;
+    for (const row of allRows.slice(0, 20)) {
+      const mdyMatch = row.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](20\d{2})/);
+      if (mdyMatch) { orderYear = parseInt(mdyMatch[3]); break; }
+      const isoMatch = row.match(/(20\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+      if (isoMatch) { orderYear = parseInt(isoMatch[1]); break; }
+      const textMatch = row.match(/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2},?\s+(20\d{2})/i);
+      if (textMatch) { orderYear = parseInt(textMatch[1]); break; }
+    }
+    if (orderYear && orderYear < 2026) {
+      return res.json({ success: true, skipped: true, message: `Order is from ${orderYear} — only 2026+ orders are auto-imported. Use manual import for older receipts.`, imported: { chemicals: 0, wearItems: 0 } });
+    }
+
     // Dedup check: hash the order and compare against import history
     const orderStr = parsedItems.map(i => `${i.productCode}:${i.shippedQty}`).sort().join('|');
     let orderHash = 0;
@@ -465,7 +469,7 @@ app.post('/api/process-pool360', async (req, res) => {
           // Update existing wear item with latest price
           await supabase.from('wear_items').update({
             price: item.unitPrice,
-            description: `Pool360: ${item.productCode} | Last order: ${item.shippedQty} units`,
+            description: `Pool360: ${item.productCode} | Qty: ${item.shippedQty}`,
           }).eq('id', existingWear.id);
         } else {
           const { data: insertedWear } = await supabase.from('wear_items').insert({
