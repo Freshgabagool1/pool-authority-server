@@ -167,6 +167,9 @@ const detectPool360Unit = (description, unitOfMeasure) => {
   if (weightMatch) return { unit: 'lbs', conversionFactor: parseInt(weightMatch[1]) };
   const multiGalMatch = desc.match(/(\d+)\s*X\s*(\d+\.?\d*)\s*GAL/);
   if (multiGalMatch) return { unit: 'gal', conversionFactor: parseInt(multiGalMatch[1]) * parseFloat(multiGalMatch[2]) };
+  // Slash-separated gallons: "6/1GAL", "4/1GAL", "2/2.5GAL"
+  const slashGal = desc.match(/(\d+)\s*\/\s*(\d+(?:\.\d+)?)\s*GAL/i);
+  if (slashGal) return { unit: 'gal', conversionFactor: parseInt(slashGal[1]) * parseFloat(slashGal[2]) };
   const galMatch = desc.match(/(\d+\.?\d*)\s*GAL/);
   if (galMatch) return { unit: 'gal', conversionFactor: parseFloat(galMatch[1]) };
   const multiQtMatch = desc.match(/(\d+)\s*X\s*(\d+)\s*QT/);
@@ -180,6 +183,16 @@ const detectPool360Unit = (description, unitOfMeasure) => {
   if (unitOfMeasure === 'DZ') return { unit: 'each', conversionFactor: 12 };
   // For cases/boxes/packs, try to detect pack count from description
   if (unitOfMeasure === 'CS' || unitOfMeasure === 'BX' || unitOfMeasure === 'PK') {
+    // Detect gallon cases first (e.g., antifreeze "6/1GAL", or "4 GAL" cases)
+    const csSlashGal = desc.match(/(\d+)\s*\/\s*(\d+(?:\.\d+)?)\s*GAL/i);
+    if (csSlashGal) return { unit: 'gal', conversionFactor: parseInt(csSlashGal[1]) * parseFloat(csSlashGal[2]) };
+    if (/GAL/i.test(desc)) {
+      const csGalMatch = desc.match(/(\d+(?:\.\d+)?)\s*GAL/i);
+      const csPackMatch = desc.match(/(\d+)\s*(?:PK|PACK|COUNT|CT|PCS?|\/\s*CS|\/\s*CASE)\b/);
+      const galPerUnit = csGalMatch ? parseFloat(csGalMatch[1]) : 1;
+      const packCount = csPackMatch ? parseInt(csPackMatch[1]) : 1;
+      return { unit: 'gal', conversionFactor: packCount * galPerUnit };
+    }
     const packMatch = desc.match(/(\d+)\s*(?:PK|PACK|COUNT|CT|PCS?)\b/);
     if (packMatch) return { unit: 'each', conversionFactor: parseInt(packMatch[1]) };
     const perMatch = desc.match(/(\d+)\s*(?:\/|PER)\s*(?:CS|CASE|BX|BOX)\b/);
@@ -371,8 +384,9 @@ app.post('/api/process-pool360', async (req, res) => {
     const pdfBuffer = Buffer.from(pdfBase64, 'base64');
     const { allRows } = await parsePdfBuffer(pdfBuffer);
 
-    // Load saved mappings
+    // Load saved mappings and import history
     const savedMappings = org.settings?.pool360Mappings || {};
+    const importHistory = org.settings?.pool360ImportHistory || [];
 
     // Parse rows with catalog info extraction and product code categorization
     const parsedItems = parsePool360Rows(allRows, savedMappings);
@@ -381,6 +395,18 @@ app.post('/api/process-pool360', async (req, res) => {
       console.log(`Pool360: extracted ${allRows.length} text rows but found 0 line items`);
       if (allRows.length > 0) console.log('Pool360 first 5 rows:', allRows.slice(0, 5));
       return res.json({ success: true, message: `No line items found in PDF (${allRows.length} text rows extracted)`, imported: { chemicals: 0, wearItems: 0 }, debugRowCount: allRows.length });
+    }
+
+    // Dedup check: hash the order and compare against import history
+    const orderStr = parsedItems.map(i => `${i.productCode}:${i.shippedQty}`).sort().join('|');
+    let orderHash = 0;
+    for (let i = 0; i < orderStr.length; i++) {
+      orderHash = ((orderHash << 5) - orderHash + orderStr.charCodeAt(i)) | 0;
+    }
+    const hashKey = 'p360_' + Math.abs(orderHash).toString(36);
+    const existingImport = importHistory.find(h => h.hash === hashKey);
+    if (existingImport) {
+      return res.json({ success: true, skipped: true, message: `Already imported on ${existingImport.date} (${existingImport.itemCount} items)`, imported: { chemicals: 0, wearItems: 0 } });
     }
 
     // Categorize and import
@@ -453,6 +479,12 @@ app.post('/api/process-pool360', async (req, res) => {
         wearCount++;
       }
     }
+
+    // Record import in history to prevent future duplicates
+    const newHistory = [...importHistory, { hash: hashKey, date: new Date().toISOString(), itemCount: parsedItems.length }];
+    await supabase.from('organizations').update({
+      settings: { ...(org.settings || {}), pool360ImportHistory: newHistory },
+    }).eq('id', orgId);
 
     res.json({
       success: true,
