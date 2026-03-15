@@ -11,6 +11,8 @@ const Anthropic = require('@anthropic-ai/sdk').default || require('@anthropic-ai
 const OpenAI = require('openai').default || require('openai');
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
+const JSZip = require('jszip');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 
@@ -813,10 +815,15 @@ function detectTags(text) {
 async function extractTextFromFile(buffer, mimetype, filename) {
   const ext = (filename || '').toLowerCase().split('.').pop();
 
-  // PDF
+  // PDF — use pdf-parse (more reliable on headless servers than pdfjs-dist)
   if (mimetype === 'application/pdf' || ext === 'pdf') {
-    const { allRows } = await parsePdfBuffer(buffer);
-    return allRows.join('\n');
+    try {
+      const data = await pdfParse(buffer);
+      return data.text || '';
+    } catch (e) {
+      console.error('PDF parse error:', e.message);
+      return '';
+    }
   }
 
   // Word (.docx)
@@ -891,23 +898,70 @@ async function extractTextFromFile(buffer, mimetype, filename) {
     return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
   }
 
-  // PowerPoint (.pptx)
-  if (ext === 'pptx' || mimetype === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
-    // Extract text from slides using xlsx library (pptx is also XML-based zip)
-    try {
-      const JSZip = require('jszip') || null;
-      if (!JSZip) throw new Error('pptx not supported');
-      // Fallback: treat as unsupported
-    } catch (e) { /* fall through */ }
-  }
-
   throw new Error(`Unsupported file type: ${ext || mimetype}. Supported: PDF, DOCX, XLSX, CSV, TXT, HTML, MD, images (JPG/PNG/WEBP)`);
 }
 
-// Multer for knowledge base uploads (in-memory, max 25MB, accept all files)
+// ---------------------------------------------------------------------------
+// ZIP extraction — recursively unzips and returns flat list of {name, buffer}
+// ---------------------------------------------------------------------------
+const SUPPORTED_EXTENSIONS = new Set(['pdf','docx','xlsx','xls','csv','txt','html','htm','md','log','rtf','xml','json','cfg','ini','jpg','jpeg','png','webp','gif','bmp','tiff','zip']);
+
+async function extractFilesFromZip(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const files = [];
+  for (const [path, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    // Skip macOS resource forks and hidden files
+    if (path.startsWith('__MACOSX') || path.startsWith('.') || path.includes('/.'  )) continue;
+    const ext = path.split('.').pop().toLowerCase();
+    if (!SUPPORTED_EXTENSIONS.has(ext)) continue;
+    const buf = await entry.async('nodebuffer');
+    if (ext === 'zip') {
+      // Recursively unzip nested zips
+      const nested = await extractFilesFromZip(buf);
+      files.push(...nested);
+    } else {
+      files.push({ name: path.split('/').pop(), buffer: buf, ext });
+    }
+  }
+  return files;
+}
+
+// Guess mimetype from extension
+function mimeFromExt(ext) {
+  const map = {
+    pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', xls: 'application/vnd.ms-excel',
+    csv: 'text/csv', txt: 'text/plain', html: 'text/html', htm: 'text/html', md: 'text/plain',
+    log: 'text/plain', rtf: 'text/plain', xml: 'text/xml', json: 'application/json',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif',
+    bmp: 'image/bmp', tiff: 'image/tiff',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+// Process a single file → returns { title, chunks[], metadata }
+async function processFileForKB(buffer, mimetype, filename) {
+  const fullText = await extractTextFromFile(buffer, mimetype, filename);
+  if (fullText.length < 50) return null;
+  const title = filename.replace(/\.[^.]+$/, '');
+  const chunks = chunkText(fullText);
+  return {
+    title,
+    chunks,
+    manufacturer: detectManufacturer(fullText),
+    equipment: detectEquipment(fullText),
+    tags: detectTags(fullText),
+    filename,
+    mimetype,
+    textLength: fullText.length,
+  };
+}
+
+// Multer for knowledge base uploads (in-memory, max 50MB for zips)
 const kbUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 },
 });
 
 app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
@@ -916,116 +970,100 @@ app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    const { source_title, manufacturer: manualMfg, equipment: manualEquip, source_type } = req.body || {};
+    const ext = (req.file.originalname || '').split('.').pop().toLowerCase();
+    const isZip = ext === 'zip' || req.file.mimetype === 'application/zip' || req.file.mimetype === 'application/x-zip-compressed';
 
-    // 1. Extract text from file (any format)
-    const fullText = await extractTextFromFile(req.file.buffer, req.file.mimetype, req.file.originalname);
-
-    if (fullText.length < 50) {
-      return res.status(400).json({ error: 'File has very little readable text. It may be empty or a format we cannot parse.' });
+    // 1. Build list of files to process
+    let fileList;
+    if (isZip) {
+      const extracted = await extractFilesFromZip(req.file.buffer);
+      if (extracted.length === 0) return res.status(400).json({ error: 'ZIP contained no supported files' });
+      fileList = extracted.map(f => ({ buffer: f.buffer, mimetype: mimeFromExt(f.ext), filename: f.name }));
+    } else {
+      fileList = [{ buffer: req.file.buffer, mimetype: req.file.mimetype, filename: req.file.originalname }];
     }
 
-    // 2. Auto-detect metadata
-    const detectedMfg = manualMfg || detectManufacturer(fullText);
-    const detectedEquip = manualEquip || detectEquipment(fullText);
-    const tags = detectTags(fullText);
-    const title = source_title || req.file.originalname.replace(/\.[^.]+$/, '');
+    // 2. Extract text from all files in parallel (up to 5 concurrent)
+    const results = [];
+    const errors = [];
+    const CONCURRENCY = 5;
+    for (let i = 0; i < fileList.length; i += CONCURRENCY) {
+      const batch = fileList.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.allSettled(
+        batch.map(f => processFileForKB(f.buffer, f.mimetype, f.filename))
+      );
+      for (let j = 0; j < batchResults.length; j++) {
+        if (batchResults[j].status === 'fulfilled' && batchResults[j].value) {
+          results.push(batchResults[j].value);
+        } else if (batchResults[j].status === 'rejected') {
+          errors.push({ file: batch[j].filename, error: batchResults[j].reason?.message || 'Unknown error' });
+        }
+      }
+    }
 
-    // 3. Chunk the text
-    const chunks = chunkText(fullText);
+    if (results.length === 0) {
+      return res.status(400).json({ error: 'No readable text found in uploaded file(s)', errors });
+    }
 
-    // 4. Generate embeddings
+    // 3. Collect ALL chunks across all files, then embed in big batches (much faster)
+    const allChunkMeta = []; // { chunkText, fileIdx }
+    for (let fi = 0; fi < results.length; fi++) {
+      for (const chunk of results[fi].chunks) {
+        allChunkMeta.push({ text: chunk, fileIdx: fi });
+      }
+    }
+
+    const allTexts = allChunkMeta.map(c => c.text);
     const allEmbeddings = [];
-    for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
-      const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
+    // Use larger batches (OpenAI supports up to 2048)
+    const BIG_BATCH = 200;
+    for (let i = 0; i < allTexts.length; i += BIG_BATCH) {
+      const batch = allTexts.slice(i, i + BIG_BATCH);
       const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: batch });
       allEmbeddings.push(...response.data.map(item => item.embedding));
-      if (i + EMBED_BATCH_SIZE < chunks.length) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
     }
 
-    // 5. Insert into knowledge_base
-    const insertRows = chunks.map((chunk, i) => ({
-      content: chunk,
-      embedding: allEmbeddings[i],
-      source_type: source_type || 'manual',
-      manufacturer: detectedMfg,
-      equipment: detectedEquip,
-      model_name: null,
-      tags: tags,
-      source_title: title,
-      source_url: null,
-      metadata: { filename: req.file.originalname, fileType: req.file.mimetype },
-    }));
+    // 4. Build insert rows
+    const insertRows = allChunkMeta.map((cm, i) => {
+      const file = results[cm.fileIdx];
+      return {
+        content: cm.text,
+        embedding: allEmbeddings[i],
+        source_type: 'manual',
+        manufacturer: file.manufacturer,
+        equipment: file.equipment,
+        model_name: null,
+        tags: file.tags,
+        source_title: file.title,
+        source_url: null,
+        metadata: { filename: file.filename, fileType: file.mimetype },
+      };
+    });
 
+    // 5. Insert in parallel batches of 500
     let inserted = 0;
-    for (let i = 0; i < insertRows.length; i += 100) {
-      const batch = insertRows.slice(i, i + 100);
+    const INSERT_BATCH = 500;
+    for (let i = 0; i < insertRows.length; i += INSERT_BATCH) {
+      const batch = insertRows.slice(i, i + INSERT_BATCH);
       const { error } = await supabase.from('knowledge_base').insert(batch);
-      if (error) {
-        console.error('KB insert error:', error.message);
-        continue;
-      }
+      if (error) { console.error('KB insert error:', error.message); continue; }
       inserted += batch.length;
     }
 
+    const totalChars = results.reduce((sum, r) => sum + r.textLength, 0);
     res.json({
       success: true,
-      message: `Ingested "${title}" — ${inserted} chunks (${Math.round(fullText.length / 1000)}k chars extracted)`,
+      message: `Ingested ${results.length} file(s) — ${inserted} chunks (${Math.round(totalChars / 1000)}k chars)`,
       details: {
+        filesProcessed: results.length,
         chunks: inserted,
-        manufacturer: detectedMfg,
-        equipment: detectedEquip,
-        tags: tags,
-        textLength: fullText.length,
-        fileType: req.file.mimetype,
+        files: results.map(r => ({ title: r.title, chunks: r.chunks.length, manufacturer: r.manufacturer, equipment: r.equipment })),
+        errors: errors.length > 0 ? errors : undefined,
       },
     });
 
   } catch (error) {
     console.error('Knowledge upload error:', error);
-    res.status(500).json({ error: 'Failed to process file', message: error.message });
-  }
-});
-
-// Keep old PDF endpoint as alias
-app.post('/api/knowledge/upload-pdf', kbUpload.single('pdf'), async (req, res) => {
-  req.file && (req.file.fieldname = 'file');
-  // Forward to the main handler by re-calling the logic
-  // Just redirect the field name
-  const origFile = req.file;
-  req.file = origFile;
-  try {
-    if (!openai) return res.status(500).json({ error: 'OpenAI not configured' });
-    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const fullText = await extractTextFromFile(req.file.buffer, req.file.mimetype, req.file.originalname);
-    if (fullText.length < 50) return res.status(400).json({ error: 'File has very little readable text.' });
-    const { source_title } = req.body || {};
-    const detectedMfg = detectManufacturer(fullText);
-    const detectedEquip = detectEquipment(fullText);
-    const tags = detectTags(fullText);
-    const title = source_title || req.file.originalname.replace(/\.[^.]+$/, '');
-    const chunks = chunkText(fullText);
-    const allEmbeddings = [];
-    for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
-      const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
-      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: batch });
-      allEmbeddings.push(...response.data.map(item => item.embedding));
-      if (i + EMBED_BATCH_SIZE < chunks.length) await new Promise(r => setTimeout(r, 200));
-    }
-    const insertRows = chunks.map((chunk, i) => ({ content: chunk, embedding: allEmbeddings[i], source_type: 'manual', manufacturer: detectedMfg, equipment: detectedEquip, model_name: null, tags, source_title: title, source_url: null, metadata: { filename: req.file.originalname } }));
-    let inserted = 0;
-    for (let i = 0; i < insertRows.length; i += 100) {
-      const batch = insertRows.slice(i, i + 100);
-      const { error } = await supabase.from('knowledge_base').insert(batch);
-      if (error) { console.error('KB insert error:', error.message); continue; }
-      inserted += batch.length;
-    }
-    res.json({ success: true, message: `Ingested "${title}" — ${inserted} chunks`, details: { chunks: inserted, manufacturer: detectedMfg, equipment: detectedEquip, tags, textLength: fullText.length } });
-  } catch (error) {
-    console.error('PDF knowledge upload error:', error);
     res.status(500).json({ error: 'Failed to process file', message: error.message });
   }
 });
