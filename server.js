@@ -9,6 +9,8 @@ const multer = require('multer');
 const sharp = require('sharp');
 const Anthropic = require('@anthropic-ai/sdk').default || require('@anthropic-ai/sdk');
 const OpenAI = require('openai').default || require('openai');
+const mammoth = require('mammoth');
+const XLSX = require('xlsx');
 
 const app = express();
 
@@ -805,41 +807,134 @@ function detectTags(text) {
   return tags;
 }
 
-// Multer for PDF uploads (in-memory, max 25MB)
-const pdfUpload = multer({
+// ---------------------------------------------------------------------------
+// File text extraction — supports PDF, DOCX, XLSX, CSV, TXT, HTML, images
+// ---------------------------------------------------------------------------
+async function extractTextFromFile(buffer, mimetype, filename) {
+  const ext = (filename || '').toLowerCase().split('.').pop();
+
+  // PDF
+  if (mimetype === 'application/pdf' || ext === 'pdf') {
+    const { allRows } = await parsePdfBuffer(buffer);
+    return allRows.join('\n');
+  }
+
+  // Word (.docx)
+  if (mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === 'docx') {
+    const result = await mammoth.extractRawText({ buffer });
+    return result.value;
+  }
+
+  // Excel (.xlsx, .xls)
+  if (mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+      mimetype === 'application/vnd.ms-excel' || ext === 'xlsx' || ext === 'xls') {
+    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const texts = [];
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const csv = XLSX.utils.sheet_to_csv(sheet);
+      if (csv.trim()) texts.push(`--- Sheet: ${sheetName} ---\n${csv}`);
+    }
+    return texts.join('\n\n');
+  }
+
+  // CSV
+  if (mimetype === 'text/csv' || ext === 'csv') {
+    return buffer.toString('utf-8');
+  }
+
+  // HTML
+  if (mimetype === 'text/html' || ext === 'html' || ext === 'htm') {
+    const html = buffer.toString('utf-8');
+    // Strip tags, decode entities, clean up whitespace
+    return html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&[a-z]+;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Plain text (.txt, .md, .log, .rtf, .xml, .json)
+  if (mimetype?.startsWith('text/') || ['txt', 'md', 'log', 'rtf', 'xml', 'json', 'cfg', 'ini'].includes(ext)) {
+    return buffer.toString('utf-8');
+  }
+
+  // Images — use Claude vision to extract text
+  if (mimetype?.startsWith('image/') || ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tiff'].includes(ext)) {
+    if (!anthropic) throw new Error('Image text extraction requires ANTHROPIC_API_KEY');
+    // Resize if needed
+    let imgBuffer = buffer;
+    let mediaType = mimetype || 'image/jpeg';
+    try {
+      const img = sharp(buffer);
+      const meta = await img.metadata();
+      if (meta.width > 2000 || meta.height > 2000) {
+        imgBuffer = await img.resize(2000, 2000, { fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+        mediaType = 'image/jpeg';
+      }
+    } catch (e) { /* use original buffer */ }
+
+    const response = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 4096,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: imgBuffer.toString('base64') } },
+          { type: 'text', text: 'Extract ALL text from this image. Include every word, number, label, model number, part number, specification, and instruction you can read. Format it as clean readable text. If this is a wiring diagram or schematic, describe the connections and components.' }
+        ]
+      }]
+    });
+    return response.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
+  }
+
+  // PowerPoint (.pptx)
+  if (ext === 'pptx' || mimetype === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
+    // Extract text from slides using xlsx library (pptx is also XML-based zip)
+    try {
+      const JSZip = require('jszip') || null;
+      if (!JSZip) throw new Error('pptx not supported');
+      // Fallback: treat as unsupported
+    } catch (e) { /* fall through */ }
+  }
+
+  throw new Error(`Unsupported file type: ${ext || mimetype}. Supported: PDF, DOCX, XLSX, CSV, TXT, HTML, MD, images (JPG/PNG/WEBP)`);
+}
+
+// Multer for knowledge base uploads (in-memory, max 25MB, accept all files)
+const kbUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    cb(null, file.mimetype === 'application/pdf');
-  },
 });
 
-app.post('/api/knowledge/upload-pdf', pdfUpload.single('pdf'), async (req, res) => {
+app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
   try {
     if (!openai) return res.status(500).json({ error: 'OpenAI not configured (set OPENAI_API_KEY)' });
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     const { source_title, manufacturer: manualMfg, equipment: manualEquip, source_type } = req.body || {};
 
-    // 1. Extract text from PDF
-    const { allRows } = await parsePdfBuffer(req.file.buffer);
-    const fullText = allRows.join('\n');
+    // 1. Extract text from file (any format)
+    const fullText = await extractTextFromFile(req.file.buffer, req.file.mimetype, req.file.originalname);
 
-    if (fullText.length < 100) {
-      return res.status(400).json({ error: 'PDF appears to have very little text. It may be a scanned image — only text-based PDFs are supported.' });
+    if (fullText.length < 50) {
+      return res.status(400).json({ error: 'File has very little readable text. It may be empty or a format we cannot parse.' });
     }
 
-    // 2. Auto-detect metadata from content
+    // 2. Auto-detect metadata
     const detectedMfg = manualMfg || detectManufacturer(fullText);
     const detectedEquip = manualEquip || detectEquipment(fullText);
     const tags = detectTags(fullText);
-    const title = source_title || req.file.originalname.replace('.pdf', '');
+    const title = source_title || req.file.originalname.replace(/\.[^.]+$/, '');
 
     // 3. Chunk the text
     const chunks = chunkText(fullText);
 
-    // 4. Generate embeddings in batches
+    // 4. Generate embeddings
     const allEmbeddings = [];
     for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
       const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
@@ -861,7 +956,7 @@ app.post('/api/knowledge/upload-pdf', pdfUpload.single('pdf'), async (req, res) 
       tags: tags,
       source_title: title,
       source_url: null,
-      metadata: { filename: req.file.originalname, pages: Math.ceil(fullText.length / 3000) },
+      metadata: { filename: req.file.originalname, fileType: req.file.mimetype },
     }));
 
     let inserted = 0;
@@ -877,19 +972,61 @@ app.post('/api/knowledge/upload-pdf', pdfUpload.single('pdf'), async (req, res) 
 
     res.json({
       success: true,
-      message: `Ingested "${title}" — ${inserted} chunks from ${allRows.length} text rows`,
+      message: `Ingested "${title}" — ${inserted} chunks (${Math.round(fullText.length / 1000)}k chars extracted)`,
       details: {
         chunks: inserted,
         manufacturer: detectedMfg,
         equipment: detectedEquip,
         tags: tags,
         textLength: fullText.length,
+        fileType: req.file.mimetype,
       },
     });
 
   } catch (error) {
+    console.error('Knowledge upload error:', error);
+    res.status(500).json({ error: 'Failed to process file', message: error.message });
+  }
+});
+
+// Keep old PDF endpoint as alias
+app.post('/api/knowledge/upload-pdf', kbUpload.single('pdf'), async (req, res) => {
+  req.file && (req.file.fieldname = 'file');
+  // Forward to the main handler by re-calling the logic
+  // Just redirect the field name
+  const origFile = req.file;
+  req.file = origFile;
+  try {
+    if (!openai) return res.status(500).json({ error: 'OpenAI not configured' });
+    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const fullText = await extractTextFromFile(req.file.buffer, req.file.mimetype, req.file.originalname);
+    if (fullText.length < 50) return res.status(400).json({ error: 'File has very little readable text.' });
+    const { source_title } = req.body || {};
+    const detectedMfg = detectManufacturer(fullText);
+    const detectedEquip = detectEquipment(fullText);
+    const tags = detectTags(fullText);
+    const title = source_title || req.file.originalname.replace(/\.[^.]+$/, '');
+    const chunks = chunkText(fullText);
+    const allEmbeddings = [];
+    for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
+      const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
+      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: batch });
+      allEmbeddings.push(...response.data.map(item => item.embedding));
+      if (i + EMBED_BATCH_SIZE < chunks.length) await new Promise(r => setTimeout(r, 200));
+    }
+    const insertRows = chunks.map((chunk, i) => ({ content: chunk, embedding: allEmbeddings[i], source_type: 'manual', manufacturer: detectedMfg, equipment: detectedEquip, model_name: null, tags, source_title: title, source_url: null, metadata: { filename: req.file.originalname } }));
+    let inserted = 0;
+    for (let i = 0; i < insertRows.length; i += 100) {
+      const batch = insertRows.slice(i, i + 100);
+      const { error } = await supabase.from('knowledge_base').insert(batch);
+      if (error) { console.error('KB insert error:', error.message); continue; }
+      inserted += batch.length;
+    }
+    res.json({ success: true, message: `Ingested "${title}" — ${inserted} chunks`, details: { chunks: inserted, manufacturer: detectedMfg, equipment: detectedEquip, tags, textLength: fullText.length } });
+  } catch (error) {
     console.error('PDF knowledge upload error:', error);
-    res.status(500).json({ error: 'Failed to process PDF', message: error.message });
+    res.status(500).json({ error: 'Failed to process file', message: error.message });
   }
 });
 
