@@ -964,6 +964,9 @@ const kbUpload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
+// In-memory job tracker for background KB processing
+const kbJobs = new Map();
+
 app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
   try {
     if (!openai) return res.status(500).json({ error: 'OpenAI not configured (set OPENAI_API_KEY)' });
@@ -983,89 +986,112 @@ app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
       fileList = [{ buffer: req.file.buffer, mimetype: req.file.mimetype, filename: req.file.originalname }];
     }
 
-    // 2. Extract text from all files in parallel (up to 5 concurrent)
-    const results = [];
-    const errors = [];
-    const CONCURRENCY = 5;
-    for (let i = 0; i < fileList.length; i += CONCURRENCY) {
-      const batch = fileList.slice(i, i + CONCURRENCY);
-      const batchResults = await Promise.allSettled(
-        batch.map(f => processFileForKB(f.buffer, f.mimetype, f.filename))
-      );
-      for (let j = 0; j < batchResults.length; j++) {
-        if (batchResults[j].status === 'fulfilled' && batchResults[j].value) {
-          results.push(batchResults[j].value);
-        } else if (batchResults[j].status === 'rejected') {
-          errors.push({ file: batch[j].filename, error: batchResults[j].reason?.message || 'Unknown error' });
-        }
-      }
-    }
+    // Generate a job ID and respond immediately
+    const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    kbJobs.set(jobId, { status: 'processing', filename: req.file.originalname, startedAt: Date.now() });
 
-    if (results.length === 0) {
-      return res.status(400).json({ error: 'No readable text found in uploaded file(s)', errors });
-    }
+    // Respond right away so Render doesn't timeout
+    res.json({ success: true, jobId, message: `Processing ${fileList.length} file(s) in background...`, status: 'processing' });
 
-    // 3. Collect ALL chunks across all files, then embed in big batches (much faster)
-    const allChunkMeta = []; // { chunkText, fileIdx }
-    for (let fi = 0; fi < results.length; fi++) {
-      for (const chunk of results[fi].chunks) {
-        allChunkMeta.push({ text: chunk, fileIdx: fi });
-      }
-    }
-
-    const allTexts = allChunkMeta.map(c => c.text);
-    const allEmbeddings = [];
-    // Use larger batches (OpenAI supports up to 2048)
-    const BIG_BATCH = 200;
-    for (let i = 0; i < allTexts.length; i += BIG_BATCH) {
-      const batch = allTexts.slice(i, i + BIG_BATCH);
-      const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: batch });
-      allEmbeddings.push(...response.data.map(item => item.embedding));
-    }
-
-    // 4. Build insert rows
-    const insertRows = allChunkMeta.map((cm, i) => {
-      const file = results[cm.fileIdx];
-      return {
-        content: cm.text,
-        embedding: allEmbeddings[i],
-        source_type: 'manual',
-        manufacturer: file.manufacturer,
-        equipment: file.equipment,
-        model_name: null,
-        tags: file.tags,
-        source_title: file.title,
-        source_url: null,
-        metadata: { filename: file.filename, fileType: file.mimetype },
-      };
-    });
-
-    // 5. Insert in parallel batches of 500
-    let inserted = 0;
-    const INSERT_BATCH = 500;
-    for (let i = 0; i < insertRows.length; i += INSERT_BATCH) {
-      const batch = insertRows.slice(i, i + INSERT_BATCH);
-      const { error } = await supabase.from('knowledge_base').insert(batch);
-      if (error) { console.error('KB insert error:', error.message); continue; }
-      inserted += batch.length;
-    }
-
-    const totalChars = results.reduce((sum, r) => sum + r.textLength, 0);
-    res.json({
-      success: true,
-      message: `Ingested ${results.length} file(s) — ${inserted} chunks (${Math.round(totalChars / 1000)}k chars)`,
-      details: {
-        filesProcessed: results.length,
-        chunks: inserted,
-        files: results.map(r => ({ title: r.title, chunks: r.chunks.length, manufacturer: r.manufacturer, equipment: r.equipment })),
-        errors: errors.length > 0 ? errors : undefined,
-      },
+    // Process in background (after response sent)
+    processKBFiles(jobId, fileList).catch(err => {
+      console.error('KB background processing error:', err);
+      kbJobs.set(jobId, { status: 'error', error: err.message });
     });
 
   } catch (error) {
     console.error('Knowledge upload error:', error);
     res.status(500).json({ error: 'Failed to process file', message: error.message });
   }
+});
+
+// Background KB file processing
+async function processKBFiles(jobId, fileList) {
+  const results = [];
+  const errors = [];
+  const CONCURRENCY = 5;
+  for (let i = 0; i < fileList.length; i += CONCURRENCY) {
+    const batch = fileList.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.allSettled(
+      batch.map(f => processFileForKB(f.buffer, f.mimetype, f.filename))
+    );
+    for (let j = 0; j < batchResults.length; j++) {
+      if (batchResults[j].status === 'fulfilled' && batchResults[j].value) {
+        results.push(batchResults[j].value);
+      } else if (batchResults[j].status === 'rejected') {
+        errors.push({ file: batch[j].filename, error: batchResults[j].reason?.message || 'Unknown error' });
+      }
+    }
+  }
+
+  if (results.length === 0) {
+    kbJobs.set(jobId, { status: 'error', error: 'No readable text found in uploaded file(s)', errors });
+    return;
+  }
+
+  // Collect ALL chunks, embed, insert
+  const allChunkMeta = [];
+  for (let fi = 0; fi < results.length; fi++) {
+    for (const chunk of results[fi].chunks) {
+      allChunkMeta.push({ text: chunk, fileIdx: fi });
+    }
+  }
+
+  kbJobs.set(jobId, { status: 'embedding', filesProcessed: results.length, totalChunks: allChunkMeta.length });
+
+  const allTexts = allChunkMeta.map(c => c.text);
+  const allEmbeddings = [];
+  const BIG_BATCH = 200;
+  for (let i = 0; i < allTexts.length; i += BIG_BATCH) {
+    const batch = allTexts.slice(i, i + BIG_BATCH);
+    const response = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: batch });
+    allEmbeddings.push(...response.data.map(item => item.embedding));
+  }
+
+  const insertRows = allChunkMeta.map((cm, i) => {
+    const file = results[cm.fileIdx];
+    return {
+      content: cm.text,
+      embedding: allEmbeddings[i],
+      source_type: 'manual',
+      manufacturer: file.manufacturer,
+      equipment: file.equipment,
+      model_name: null,
+      tags: file.tags,
+      source_title: file.title,
+      source_url: null,
+      metadata: { filename: file.filename, fileType: file.mimetype },
+    };
+  });
+
+  let inserted = 0;
+  const INSERT_BATCH = 500;
+  for (let i = 0; i < insertRows.length; i += INSERT_BATCH) {
+    const batch = insertRows.slice(i, i + INSERT_BATCH);
+    const { error } = await supabase.from('knowledge_base').insert(batch);
+    if (error) { console.error('KB insert error:', error.message); continue; }
+    inserted += batch.length;
+  }
+
+  const totalChars = results.reduce((sum, r) => sum + r.textLength, 0);
+  kbJobs.set(jobId, {
+    status: 'done',
+    message: `Ingested ${results.length} file(s) — ${inserted} chunks (${Math.round(totalChars / 1000)}k chars)`,
+    filesProcessed: results.length,
+    chunks: inserted,
+    files: results.map(r => ({ title: r.title, chunks: r.chunks.length, manufacturer: r.manufacturer, equipment: r.equipment })),
+    errors: errors.length > 0 ? errors : undefined,
+  });
+
+  // Clean up job after 10 minutes
+  setTimeout(() => kbJobs.delete(jobId), 10 * 60 * 1000);
+}
+
+// Poll job status
+app.get('/api/knowledge/job/:jobId', async (req, res) => {
+  const job = kbJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found or expired' });
+  res.json(job);
 });
 
 // GET /api/knowledge/stats — Get knowledge base stats
