@@ -942,7 +942,9 @@ function mimeFromExt(ext) {
 
 // Process a single file → returns { title, chunks[], metadata }
 async function processFileForKB(buffer, mimetype, filename) {
+  console.log(`KB processing: ${filename} | mime: ${mimetype} | size: ${buffer.length} bytes`);
   const fullText = await extractTextFromFile(buffer, mimetype, filename);
+  console.log(`KB extracted: ${filename} → ${fullText.length} chars`);
   if (fullText.length < 50) return null;
   const title = filename.replace(/\.[^.]+$/, '');
   const chunks = chunkText(fullText);
