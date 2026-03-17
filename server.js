@@ -12,7 +12,6 @@ const OpenAI = require('openai').default || require('openai');
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
 const JSZip = require('jszip');
-const pdfParse = require('pdf-parse');
 
 const app = express();
 
@@ -815,11 +814,11 @@ function detectTags(text) {
 async function extractTextFromFile(buffer, mimetype, filename) {
   const ext = (filename || '').toLowerCase().split('.').pop();
 
-  // PDF — use pdf-parse (more reliable on headless servers than pdfjs-dist)
+  // PDF — use pdfjs-dist (same as Pool360 import)
   if (mimetype === 'application/pdf' || ext === 'pdf') {
     try {
-      const data = await pdfParse(buffer);
-      return data.text || '';
+      const { allRows } = await parsePdfBuffer(buffer);
+      return allRows.join('\n');
     } catch (e) {
       console.error('PDF parse error:', e.message);
       return '';
