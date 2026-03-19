@@ -32,7 +32,7 @@ const supabase = (supabaseUrl && supabaseServiceKey) ? createClient(supabaseUrl,
 // ============================================================
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
-  : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8100'];
+  : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8100', 'https://pool-authority.vercel.app'];
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -1430,8 +1430,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
         },
       ],
       mode: 'payment',
-      success_url: successUrl || 'https://poolauthority.com/payment-success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: cancelUrl || 'https://poolauthority.com/payment-cancelled',
+      success_url: successUrl || 'https://pool-authority.vercel.app/payment-success?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: cancelUrl || 'https://pool-authority.vercel.app/payment-cancelled',
       customer_email: customerEmail || undefined,
       metadata: {
         customerName,

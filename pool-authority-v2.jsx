@@ -3,7 +3,7 @@ import { LineChart, Line, AreaChart, Area, BarChart, Bar, XAxis, YAxis, Cartesia
 
 // Config — set these via environment variables (REACT_APP_GOOGLE_MAPS_KEY, REACT_APP_PAYMENT_SERVER_URL)
 const GOOGLE_MAPS_KEY = typeof process !== 'undefined' && process.env?.REACT_APP_GOOGLE_MAPS_KEY || '';
-const PAYMENT_SERVER_URL = typeof process !== 'undefined' && process.env?.REACT_APP_PAYMENT_SERVER_URL || 'http://localhost:3001';
+const PAYMENT_SERVER_URL = typeof process !== 'undefined' && process.env?.REACT_APP_PAYMENT_SERVER_URL || 'https://pool-authority-server.onrender.com';
 
 // HTML escaping utility — prevents XSS in generated HTML invoices
 const escapeHtml = (str) => {
