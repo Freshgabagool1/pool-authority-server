@@ -3,6 +3,7 @@
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
@@ -19,20 +20,123 @@ const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Supabase client with service role key (for auto-import writes)
-const supabaseUrl = process.env.SUPABASE_URL || 'https://visqepsesgcarjcnvvbx.supabase.co';
+const supabaseUrl = process.env.SUPABASE_URL;
+if (!supabaseUrl) {
+  console.warn('WARNING: SUPABASE_URL not set. Supabase features will be disabled.');
+}
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const supabase = supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : null;
+const supabase = (supabaseUrl && supabaseServiceKey) ? createClient(supabaseUrl, supabaseServiceKey) : null;
 
-// Middleware
+// ============================================================
+// CORS — restrict to your actual domain(s) in production
+// ============================================================
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+  : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8100'];
+
 app.use(cors({
-  origin: '*', // In production, set this to your specific domain
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, server-to-server)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes('*')) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+  credentials: true,
 }));
+
+// ============================================================
+// Webhook route MUST be before express.json() to get raw body
+// ============================================================
+app.post('/api/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+
 app.use(express.json({ limit: '10mb' }));
+
+// ============================================================
+// HTML escaping utility — prevents XSS in emails and templates
+// ============================================================
+const escapeHtml = (str) => {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+};
+
+// ============================================================
+// Authentication Middleware
+// ============================================================
+const authenticateUser = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  }
+  const token = authHeader.replace('Bearer ', '');
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Authentication failed' });
+  }
+};
+
+// Optional auth — sets req.user if token present but doesn't block
+const optionalAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ') && supabase) {
+    try {
+      const token = authHeader.replace('Bearer ', '');
+      const { data: { user } } = await supabase.auth.getUser(token);
+      if (user) req.user = user;
+    } catch (e) { /* continue without auth */ }
+  }
+  next();
+};
+
+// Simple rate limiter (in-memory, per-IP)
+const rateLimitStore = new Map();
+const rateLimit = (maxRequests, windowMs) => (req, res, next) => {
+  const key = req.ip + ':' + req.path;
+  const now = Date.now();
+  const entry = rateLimitStore.get(key);
+  if (!entry || now - entry.windowStart > windowMs) {
+    rateLimitStore.set(key, { windowStart: now, count: 1 });
+    return next();
+  }
+  if (entry.count >= maxRequests) {
+    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+  }
+  entry.count++;
+  return next();
+};
+// Clean up rate limit store every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now - entry.windowStart > 300000) rateLimitStore.delete(key);
+  }
+}, 300000);
 
 // Store for payment sessions (in production, use a real database)
 const paymentSessions = new Map();
+// Clean up old payment sessions every hour (prevent memory leak)
+setInterval(() => {
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [id, session] of paymentSessions) {
+    if (new Date(session.createdAt).getTime() < oneDayAgo) {
+      paymentSessions.delete(id);
+    }
+  }
+}, 60 * 60 * 1000);
 
 // ============================================================
 // Email Setup (Resend HTTP API)
@@ -49,9 +153,9 @@ const processTemplate = (template, data) => {
   result = result.replace(/\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g, (match, varName, content) => {
     return data[varName] ? content : '';
   });
-  // Replace {{variable}} placeholders
+  // Replace {{variable}} placeholders — use replaceAll to avoid ReDoS from regex-special keys
   for (const [key, value] of Object.entries(data)) {
-    result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value || '');
+    result = result.replaceAll(`{{${key}}}`, escapeHtml(value) || '');
   }
   return result;
 };
@@ -60,6 +164,7 @@ const processTemplate = (template, data) => {
 const textToHtml = (text) => {
   if (!text) return '';
   return text
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" style="color:#1e3a5f;text-decoration:underline;">$1</a>')
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>')
     .replace(/• /g, '&bull; ');
@@ -68,9 +173,12 @@ const textToHtml = (text) => {
 // Build photo HTML for embedding in emails
 const buildPhotosHtml = (photoUrls) => {
   if (!photoUrls || !Array.isArray(photoUrls) || photoUrls.length === 0) return '';
-  const images = photoUrls.map(url =>
-    `<img src="${url}" alt="Service photo" style="width:100%;max-width:560px;height:auto;border-radius:8px;display:block;" />`
-  ).join('<div style="height:12px;"></div>');
+  const images = photoUrls
+    .filter(url => typeof url === 'string' && /^https?:\/\//.test(url))
+    .map(url =>
+      `<img src="${escapeHtml(url)}" alt="Service photo" style="width:100%;max-width:560px;height:auto;border-radius:8px;display:block;" />`
+    ).join('<div style="height:12px;"></div>');
+  if (!images) return '';
   return `<div style="margin-top:20px;padding-top:16px;border-top:1px solid #eee;">
     <h3 style="margin:0 0 12px 0;color:#1e3a5f;font-size:16px;">Service Photos</h3>
     ${images}
@@ -79,9 +187,9 @@ const buildPhotosHtml = (photoUrls) => {
 
 // Build a styled HTML email wrapper
 const buildEmailHtml = (bodyContent, companySettings) => {
-  const companyName = companySettings?.companyName || 'Pool Authority';
-  const companyPhone = companySettings?.phone || '';
-  const companyEmail = companySettings?.email || EMAIL_FROM;
+  const companyName = escapeHtml(companySettings?.companyName || 'Pool Authority');
+  const companyPhone = escapeHtml(companySettings?.phone || '');
+  const companyEmail = escapeHtml(companySettings?.email || EMAIL_FROM);
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
@@ -104,7 +212,9 @@ const sendEmail = async (to, subject, htmlBody, fromName, attachments) => {
   if (!RESEND_API_KEY) {
     throw new Error('Email not configured. Set RESEND_API_KEY environment variable on Render.');
   }
-  const from = fromName ? `${fromName} <${EMAIL_FROM.replace(/^.*</, '').replace(/>$/, '') || EMAIL_FROM}>` : EMAIL_FROM;
+  const emailMatch = EMAIL_FROM.match(/<([^>]+)>/);
+  const fromAddress = emailMatch ? emailMatch[1] : EMAIL_FROM;
+  const from = fromName ? `${fromName} <${fromAddress}>` : EMAIL_FROM;
   const payload = { from, to: [to], subject, html: htmlBody };
   if (attachments && attachments.length > 0) {
     payload.attachments = attachments;
@@ -372,7 +482,8 @@ app.post('/api/process-pool360', async (req, res) => {
     }
 
     const storedKey = org.settings?.pool360ImportKey;
-    if (!storedKey || storedKey !== apiKey) {
+    if (!storedKey || !apiKey || storedKey.length !== apiKey.length ||
+        !crypto.timingSafeEqual(Buffer.from(storedKey), Buffer.from(apiKey))) {
       return res.status(401).json({ error: 'Invalid API key' });
     }
 
@@ -410,11 +521,7 @@ app.post('/api/process-pool360', async (req, res) => {
 
     // Dedup check: hash the order and compare against import history
     const orderStr = parsedItems.map(i => `${i.productCode}:${i.shippedQty}`).sort().join('|');
-    let orderHash = 0;
-    for (let i = 0; i < orderStr.length; i++) {
-      orderHash = ((orderHash << 5) - orderHash + orderStr.charCodeAt(i)) | 0;
-    }
-    const hashKey = 'p360_' + Math.abs(orderHash).toString(36);
+    const hashKey = 'p360_' + crypto.createHash('sha256').update(orderStr).digest('hex').slice(0, 12);
     const existingImport = importHistory.find(h => h.hash === hashKey);
     if (existingImport) {
       return res.json({ success: true, skipped: true, message: `Already imported on ${existingImport.date} (${existingImport.itemCount} items)`, imported: { chemicals: 0, wearItems: 0 } });
@@ -423,16 +530,18 @@ app.post('/api/process-pool360', async (req, res) => {
     // Categorize and import
     let chemCount = 0, wearCount = 0;
 
-    // Fetch existing inventory
-    const { data: existingChemicals } = await supabase
+    // Fetch existing inventory (default to [] to prevent null pointer)
+    const { data: existingChemicals_ } = await supabase
       .from('chemical_inventory')
       .select('*')
       .eq('org_id', orgId);
+    const existingChemicals = existingChemicals_ || [];
 
-    const { data: existingWearItems } = await supabase
+    const { data: existingWearItems_ } = await supabase
       .from('wear_items')
       .select('*')
       .eq('org_id', orgId);
+    const existingWearItems = existingWearItems_ || [];
 
     for (const item of parsedItems) {
       const itemType = item.itemType;
@@ -618,7 +727,7 @@ function formatContext(chunks) {
 }
 
 // POST /api/tech-assist — Main diagnostic endpoint
-app.post('/api/tech-assist', techAssistUpload.single('image'), async (req, res) => {
+app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUpload.single('image'), async (req, res) => {
   try {
     if (!anthropic || !openai) {
       return res.status(500).json({ error: 'AI not configured. Set ANTHROPIC_API_KEY and OPENAI_API_KEY.' });
@@ -658,7 +767,14 @@ app.post('/api/tech-assist', techAssistUpload.single('image'), async (req, res) 
     if (conversation_history) {
       try {
         const history = JSON.parse(conversation_history);
-        messages.push(...history);
+        // Sanitize: only allow user/assistant roles with string content (prevent prompt injection)
+        if (Array.isArray(history)) {
+          for (const msg of history) {
+            if (msg && ['user', 'assistant'].includes(msg.role) && (typeof msg.content === 'string' || Array.isArray(msg.content))) {
+              messages.push({ role: msg.role, content: msg.content });
+            }
+          }
+        }
       } catch (e) { /* ignore malformed history */ }
     }
     messages.push({ role: 'user', content: userContent });
@@ -685,6 +801,7 @@ app.post('/api/tech-assist', techAssistUpload.single('image'), async (req, res) 
         response: assistantMessage,
         knowledge_ids: knowledgeChunks.map(c => c.id),
         equipment_tag: equipment || null,
+        tech_id: req.user?.id || null,
       })
       .then(({ error }) => {
         if (error) console.error('Failed to log diagnostic session:', error);
@@ -713,14 +830,20 @@ app.post('/api/tech-assist', techAssistUpload.single('image'), async (req, res) 
 });
 
 // POST /api/tech-assist/rate — Rate a diagnostic session
-app.post('/api/tech-assist/rate', async (req, res) => {
+app.post('/api/tech-assist/rate', optionalAuth, async (req, res) => {
   try {
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
     const { session_id, rating, resolved } = req.body;
-    const { error } = await supabase
+    if (!session_id || typeof rating !== 'number' || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'Invalid rating data. session_id required, rating must be 1-5.' });
+    }
+    const query = supabase
       .from('diagnostic_sessions')
-      .update({ rating, resolved })
+      .update({ rating, resolved: !!resolved })
       .eq('id', session_id);
+    // If user is authenticated, only allow rating own sessions
+    if (req.user) query.eq('tech_id', req.user.id);
+    const { error } = await query;
     if (error) return res.status(500).json({ error: error.message });
     res.json({ success: true });
   } catch (error) {
@@ -905,19 +1028,27 @@ async function extractTextFromFile(buffer, mimetype, filename) {
 // ---------------------------------------------------------------------------
 const SUPPORTED_EXTENSIONS = new Set(['pdf','docx','xlsx','xls','csv','txt','html','htm','md','log','rtf','xml','json','cfg','ini','jpg','jpeg','png','webp','gif','bmp','tiff','zip']);
 
-async function extractFilesFromZip(buffer) {
+const MAX_ZIP_DEPTH = 3;
+const MAX_EXTRACTED_SIZE = 200 * 1024 * 1024; // 200MB max total extracted size
+
+async function extractFilesFromZip(buffer, depth = 0, totalSize = { bytes: 0 }) {
+  if (depth > MAX_ZIP_DEPTH) throw new Error('ZIP nesting too deep (max 3 levels)');
   const zip = await JSZip.loadAsync(buffer);
   const files = [];
   for (const [path, entry] of Object.entries(zip.files)) {
     if (entry.dir) continue;
     // Skip macOS resource forks and hidden files
-    if (path.startsWith('__MACOSX') || path.startsWith('.') || path.includes('/.'  )) continue;
+    if (path.startsWith('__MACOSX') || path.startsWith('.') || path.includes('/.')) continue;
     const ext = path.split('.').pop().toLowerCase();
     if (!SUPPORTED_EXTENSIONS.has(ext)) continue;
     const buf = await entry.async('nodebuffer');
+    totalSize.bytes += buf.length;
+    if (totalSize.bytes > MAX_EXTRACTED_SIZE) {
+      throw new Error(`Extracted content exceeds ${MAX_EXTRACTED_SIZE / 1024 / 1024}MB limit`);
+    }
     if (ext === 'zip') {
       // Recursively unzip nested zips
-      const nested = await extractFilesFromZip(buf);
+      const nested = await extractFilesFromZip(buf, depth + 1, totalSize);
       files.push(...nested);
     } else {
       files.push({ name: path.split('/').pop(), buffer: buf, ext });
@@ -968,7 +1099,7 @@ const kbUpload = multer({
 // In-memory job tracker for background KB processing
 const kbJobs = new Map();
 
-app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
+app.post('/api/knowledge/upload', rateLimit(5, 60000), optionalAuth, kbUpload.single('file'), async (req, res) => {
   try {
     if (!openai) return res.status(500).json({ error: 'OpenAI not configured (set OPENAI_API_KEY)' });
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
@@ -998,6 +1129,8 @@ app.post('/api/knowledge/upload', kbUpload.single('file'), async (req, res) => {
     processKBFiles(jobId, fileList).catch(err => {
       console.error('KB background processing error:', err);
       kbJobs.set(jobId, { status: 'error', error: err.message });
+      // Clean up failed jobs after 10 minutes (prevent memory leak)
+      setTimeout(() => kbJobs.delete(jobId), 10 * 60 * 1000);
     });
 
   } catch (error) {
@@ -1125,7 +1258,7 @@ app.get('/api/knowledge/stats', async (req, res) => {
 // ============================================================
 
 // POST /api/send-email — Generic email (used for contracts, water test results)
-app.post('/api/send-email', async (req, res) => {
+app.post('/api/send-email', rateLimit(10, 60000), optionalAuth, async (req, res) => {
   try {
     const { to, subject, html, from } = req.body;
     if (!to || !subject || !html) {
@@ -1140,7 +1273,7 @@ app.post('/api/send-email', async (req, res) => {
 });
 
 // POST /send-invoice — Monthly invoice & payment reminder emails
-app.post('/send-invoice', async (req, res) => {
+app.post('/send-invoice', rateLimit(10, 60000), optionalAuth, async (req, res) => {
   try {
     const { to, template, data, companySettings, paymentLink, attachment } = req.body;
     if (!to || !template) {
@@ -1168,7 +1301,7 @@ app.post('/send-invoice', async (req, res) => {
 });
 
 // POST /send-weekly-update — Weekly service updates, job confirmations, job completions
-app.post('/send-weekly-update', async (req, res) => {
+app.post('/send-weekly-update', rateLimit(10, 60000), optionalAuth, async (req, res) => {
   try {
     const { to, template, data, companySettings, paymentLink } = req.body;
     if (!to || !template) {
@@ -1195,7 +1328,7 @@ app.post('/send-weekly-update', async (req, res) => {
 });
 
 // POST /send-quote — Quote emails
-app.post('/send-quote', async (req, res) => {
+app.post('/send-quote', rateLimit(10, 60000), optionalAuth, async (req, res) => {
   try {
     const { to, template, data, companySettings, attachment } = req.body;
     if (!to || !template) {
@@ -1219,10 +1352,11 @@ app.post('/send-quote', async (req, res) => {
 
 // Health check endpoint
 app.get('/', (req, res) => {
+  const isLive = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
   res.json({
     status: 'Pool Authority Payment Server Running',
-    version: '1.3.0',
-    stripe: 'connected',
+    version: '1.4.0',
+    stripe: process.env.STRIPE_SECRET_KEY ? (isLive ? 'connected (live)' : 'connected (test)') : 'not configured',
     email: RESEND_API_KEY ? 'configured' : 'not configured',
     pool360Import: supabase ? 'enabled' : 'disabled',
     techAssist: (anthropic && openai) ? 'enabled' : 'disabled (set ANTHROPIC_API_KEY + OPENAI_API_KEY)'
@@ -1244,11 +1378,13 @@ app.post('/api/create-checkout-session', async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: 'Valid amount is required' });
+    const parsedAmount = typeof amount === 'number' ? amount : parseFloat(amount);
+    if (!parsedAmount || parsedAmount <= 0 || parsedAmount > 999999 || isNaN(parsedAmount)) {
+      return res.status(400).json({ error: 'Valid amount is required (between $0.01 and $999,999)' });
     }
 
     // Create Stripe Checkout Session
+    const unitAmount = Math.round((parsedAmount + Number.EPSILON) * 100); // Safe cent conversion
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [
@@ -1259,7 +1395,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
               name: description || 'Pool Authority Service',
               description: `Invoice #${invoiceNumber || 'N/A'}`,
             },
-            unit_amount: Math.round(amount * 100), // Convert to cents
+            unit_amount: unitAmount,
           },
           quantity: 1,
         },
@@ -1317,7 +1453,7 @@ app.post('/api/create-payment-link', async (req, res) => {
     // First create a price
     const price = await stripe.prices.create({
       currency: 'usd',
-      unit_amount: Math.round(amount * 100),
+      unit_amount: Math.round((amount + Number.EPSILON) * 100),
       product_data: {
         name: description || 'Pool Authority Service',
       },
@@ -1376,8 +1512,8 @@ app.get('/api/payment-status/:sessionId', async (req, res) => {
   }
 });
 
-// Webhook endpoint for Stripe events
-app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// Webhook handler (route registered above express.json() middleware for raw body access)
+async function handleStripeWebhook(req, res) {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -1386,8 +1522,12 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
   try {
     if (webhookSecret) {
       event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } else if (process.env.NODE_ENV === 'production') {
+      // Require webhook secret in production — prevent forged events
+      console.error('STRIPE_WEBHOOK_SECRET not set in production — rejecting webhook');
+      return res.status(500).json({ error: 'Webhook secret not configured' });
     } else {
-      // For testing without webhook signature verification
+      // Allow unverified webhooks only in development
       event = JSON.parse(req.body);
     }
   } catch (err) {
@@ -1397,7 +1537,7 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
 
   // Handle the event
   switch (event.type) {
-    case 'checkout.session.completed':
+    case 'checkout.session.completed': {
       const session = event.data.object;
       console.log('Payment successful!', {
         sessionId: session.id,
@@ -1405,7 +1545,7 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
         customer: session.customer_email,
         metadata: session.metadata
       });
-      
+
       // Update payment session status
       if (paymentSessions.has(session.id)) {
         const paymentSession = paymentSessions.get(session.id);
@@ -1414,18 +1554,20 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
         paymentSessions.set(session.id, paymentSession);
       }
       break;
+    }
 
-    case 'payment_intent.payment_failed':
+    case 'payment_intent.payment_failed': {
       const failedPayment = event.data.object;
       console.log('Payment failed:', failedPayment.id);
       break;
+    }
 
     default:
       console.log(`Unhandled event type: ${event.type}`);
   }
 
   res.json({ received: true });
-});
+}
 
 // Get all payment sessions (for admin)
 app.get('/api/payments', (req, res) => {
@@ -1443,7 +1585,7 @@ app.listen(PORT, () => {
 🏊 Pool Authority Payment Server
 ================================
 Server running on port ${PORT}
-Stripe: Connected (Test Mode)
+Stripe: ${process.env.STRIPE_SECRET_KEY?.startsWith('sk_live') ? 'Connected (LIVE)' : 'Connected (Test Mode)'}
 
 Endpoints:
 - POST /api/create-checkout-session - Create payment session
@@ -1454,7 +1596,7 @@ Endpoints:
 - POST /api/process-pool360 - Auto-import Pool360 PDF
 - POST /api/tech-assist - AI diagnostic assistant
 - POST /api/tech-assist/rate - Rate diagnostic session
-- POST /api/knowledge/upload-pdf - Upload PDF to knowledge base
+- POST /api/knowledge/upload - Upload file to knowledge base
 - GET  /api/knowledge/stats - Knowledge base stats
 - POST /api/send-email - Send generic HTML email
 - POST /send-invoice - Send invoice/payment reminder
