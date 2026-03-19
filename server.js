@@ -623,7 +623,7 @@ app.post('/api/process-pool360', async (req, res) => {
 // AI Tech Diagnostic Assistant (RAG)
 // ============================================================
 
-const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const CLAUDE_MODEL = 'claude-sonnet-4-5-20250514';
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const MAX_CONTEXT_CHUNKS = 5;
 const MAX_IMAGE_DIMENSION = 1568;
@@ -693,24 +693,31 @@ async function searchKnowledge(embedding, filters = {}) {
 }
 
 async function processImage(imageBuffer) {
-  const image = sharp(imageBuffer);
-  const metadata = await image.metadata();
-  let processed = image;
-  if (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) {
-    processed = image.resize(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION, {
-      fit: 'inside',
-      withoutEnlargement: true,
-    });
+  try {
+    const image = sharp(imageBuffer);
+    const metadata = await image.metadata();
+    console.log(`Processing image: ${metadata.width}x${metadata.height} ${metadata.format}`);
+    let processed = image;
+    if (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) {
+      processed = image.resize(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION, {
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+    }
+    const buffer = await processed.jpeg({ quality: 85 }).toBuffer();
+    console.log(`Image processed: ${(buffer.length / 1024).toFixed(0)}KB base64`);
+    return {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: 'image/jpeg',
+        data: buffer.toString('base64'),
+      },
+    };
+  } catch (err) {
+    console.error('Image processing failed:', err.message);
+    throw new Error(`Failed to process image: ${err.message}`);
   }
-  const buffer = await processed.jpeg({ quality: 85 }).toBuffer();
-  return {
-    type: 'image',
-    source: {
-      type: 'base64',
-      media_type: 'image/jpeg',
-      data: buffer.toString('base64'),
-    },
-  };
 }
 
 function formatContext(chunks) {
@@ -741,8 +748,11 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
       return res.status(400).json({ error: 'Question is required' });
     }
 
+    console.log(`[tech-assist] Question: "${question.slice(0, 80)}..." | Image: ${!!req.file} | History: ${conversation_history ? 'yes' : 'no'}`);
+
     // 1. Generate embedding for the question
     const embedding = await getQueryEmbedding(question);
+    console.log('[tech-assist] Embedding generated');
 
     // 2. Search knowledge base
     const knowledgeChunks = await searchKnowledge(embedding, {
@@ -753,6 +763,7 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
     // 3. Build context
     const contextStr = formatContext(knowledgeChunks);
     const systemPrompt = TECH_ASSIST_SYSTEM_PROMPT.replace('{context}', contextStr);
+    console.log(`[tech-assist] Knowledge chunks: ${knowledgeChunks.length}`);
 
     // 4. Build message content (text + optional image)
     const userContent = [];
@@ -778,14 +789,32 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
       } catch (e) { /* ignore malformed history */ }
     }
     messages.push({ role: 'user', content: userContent });
+    console.log(`[tech-assist] Calling Claude (${CLAUDE_MODEL})...`);
 
-    // 6. Call Claude
-    const response = await anthropic.messages.create({
-      model: CLAUDE_MODEL,
-      max_tokens: 2048,
-      system: systemPrompt,
-      messages: messages,
-    });
+    // 6. Call Claude (with timeout to prevent indefinite hangs)
+    const AI_TIMEOUT = 60000; // 60 seconds
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('AI_TIMEOUT')), AI_TIMEOUT)
+    );
+    let response;
+    try {
+      response = await Promise.race([
+        anthropic.messages.create({
+          model: CLAUDE_MODEL,
+          max_tokens: 2048,
+          system: systemPrompt,
+          messages: messages,
+        }),
+        timeoutPromise,
+      ]);
+    } catch (apiErr) {
+      if (apiErr.message === 'AI_TIMEOUT') {
+        console.error('[tech-assist] Claude API timed out after 60s');
+        return res.status(504).json({ error: 'AI response timed out. Try again with a shorter question or without an image.' });
+      }
+      throw apiErr;
+    }
+    console.log(`[tech-assist] Claude responded: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out`);
 
     const assistantMessage = response.content
       .filter(block => block.type === 'text')
