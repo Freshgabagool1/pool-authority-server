@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { LineChart, Line, AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, PieChart, Pie, Cell } from 'recharts';
 
-// Config — move API keys to environment variables in production
-const GOOGLE_MAPS_KEY = typeof process !== 'undefined' && process.env?.REACT_APP_GOOGLE_MAPS_KEY || 'AIzaSyDnhsQnmylUDFWgbiMF-Etktm-9ZY6Aaw8';
+// Config — set these via environment variables (REACT_APP_GOOGLE_MAPS_KEY, REACT_APP_PAYMENT_SERVER_URL)
+const GOOGLE_MAPS_KEY = typeof process !== 'undefined' && process.env?.REACT_APP_GOOGLE_MAPS_KEY || '';
 const PAYMENT_SERVER_URL = typeof process !== 'undefined' && process.env?.REACT_APP_PAYMENT_SERVER_URL || 'http://localhost:3001';
 
 // HTML escaping utility — prevents XSS in generated HTML invoices
