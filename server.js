@@ -623,7 +623,7 @@ app.post('/api/process-pool360', async (req, res) => {
 // AI Tech Diagnostic Assistant (RAG)
 // ============================================================
 
-const CLAUDE_MODEL = 'claude-sonnet-4-5-20250514';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250514';
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 const MAX_CONTEXT_CHUNKS = 5;
 const MAX_IMAGE_DIMENSION = 1568;
