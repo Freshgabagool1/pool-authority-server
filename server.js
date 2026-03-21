@@ -17,7 +17,10 @@ const JSZip = require('jszip');
 const app = express();
 
 // Your Stripe Secret Key (use environment variable in production!)
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+if (!stripe) {
+  console.warn('WARNING: STRIPE_SECRET_KEY not set. Payment features will be disabled.');
+}
 
 // Supabase client with service role key (for auto-import writes)
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -615,7 +618,8 @@ app.post('/api/process-pool360', async (req, res) => {
 
   } catch (error) {
     console.error('Pool360 auto-import error:', error);
-    res.status(500).json({ error: 'Failed to process Pool360 PDF', message: error.message });
+    const safeMessage = process.env.NODE_ENV === 'production' ? 'Internal server error' : error.message;
+    res.status(500).json({ error: 'Failed to process Pool360 PDF', message: safeMessage });
   }
 });
 
@@ -781,7 +785,7 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
         // Sanitize: only allow user/assistant roles with string content (prevent prompt injection)
         if (Array.isArray(history)) {
           for (const msg of history) {
-            if (msg && ['user', 'assistant'].includes(msg.role) && (typeof msg.content === 'string' || Array.isArray(msg.content))) {
+            if (msg && ['user', 'assistant'].includes(msg.role) && typeof msg.content === 'string') {
               messages.push({ role: msg.role, content: msg.content });
             }
           }
@@ -793,9 +797,10 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
 
     // 6. Call Claude (with timeout to prevent indefinite hangs)
     const AI_TIMEOUT = 60000; // 60 seconds
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('AI_TIMEOUT')), AI_TIMEOUT)
-    );
+    let timeoutTimer;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutTimer = setTimeout(() => reject(new Error('AI_TIMEOUT')), AI_TIMEOUT);
+    });
     let response;
     try {
       response = await Promise.race([
@@ -813,6 +818,8 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
         return res.status(504).json({ error: 'AI response timed out. Try again with a shorter question or without an image.' });
       }
       throw apiErr;
+    } finally {
+      clearTimeout(timeoutTimer);
     }
     console.log(`[tech-assist] Claude responded: ${response.usage.input_tokens} in / ${response.usage.output_tokens} out`);
 
@@ -1058,18 +1065,24 @@ async function extractTextFromFile(buffer, mimetype, filename) {
 const SUPPORTED_EXTENSIONS = new Set(['pdf','docx','xlsx','xls','csv','txt','html','htm','md','log','rtf','xml','json','cfg','ini','jpg','jpeg','png','webp','gif','bmp','tiff','zip']);
 
 const MAX_ZIP_DEPTH = 3;
-const MAX_EXTRACTED_SIZE = 200 * 1024 * 1024; // 200MB max total extracted size
+const MAX_EXTRACTED_SIZE = 50 * 1024 * 1024; // 50MB max total extracted size
+const MAX_ZIP_FILE_COUNT = 500; // Max files in a single ZIP
 
 async function extractFilesFromZip(buffer, depth = 0, totalSize = { bytes: 0 }) {
   if (depth > MAX_ZIP_DEPTH) throw new Error('ZIP nesting too deep (max 3 levels)');
   const zip = await JSZip.loadAsync(buffer);
   const files = [];
+  let fileCount = 0;
   for (const [path, entry] of Object.entries(zip.files)) {
     if (entry.dir) continue;
     // Skip macOS resource forks and hidden files
     if (path.startsWith('__MACOSX') || path.startsWith('.') || path.includes('/.')) continue;
     const ext = path.split('.').pop().toLowerCase();
     if (!SUPPORTED_EXTENSIONS.has(ext)) continue;
+    fileCount++;
+    if (fileCount > MAX_ZIP_FILE_COUNT) {
+      throw new Error(`ZIP contains too many files (max ${MAX_ZIP_FILE_COUNT})`);
+    }
     const buf = await entry.async('nodebuffer');
     totalSize.bytes += buf.length;
     if (totalSize.bytes > MAX_EXTRACTED_SIZE) {
@@ -1128,7 +1141,7 @@ const kbUpload = multer({
 // In-memory job tracker for background KB processing
 const kbJobs = new Map();
 
-app.post('/api/knowledge/upload', rateLimit(5, 60000), optionalAuth, kbUpload.single('file'), async (req, res) => {
+app.post('/api/knowledge/upload', rateLimit(5, 60000), authenticateUser, kbUpload.single('file'), async (req, res) => {
   try {
     if (!openai) return res.status(500).json({ error: 'OpenAI not configured (set OPENAI_API_KEY)' });
     if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
@@ -1287,7 +1300,7 @@ app.get('/api/knowledge/stats', async (req, res) => {
 // ============================================================
 
 // POST /api/send-email — Generic email (used for contracts, water test results)
-app.post('/api/send-email', rateLimit(10, 60000), optionalAuth, async (req, res) => {
+app.post('/api/send-email', rateLimit(10, 60000), authenticateUser, async (req, res) => {
   try {
     const { to, subject, html, from } = req.body;
     if (!to || !subject || !html) {
@@ -1302,7 +1315,7 @@ app.post('/api/send-email', rateLimit(10, 60000), optionalAuth, async (req, res)
 });
 
 // POST /send-invoice — Monthly invoice & payment reminder emails
-app.post('/send-invoice', rateLimit(10, 60000), optionalAuth, async (req, res) => {
+app.post('/send-invoice', rateLimit(10, 60000), authenticateUser, async (req, res) => {
   try {
     const { to, template, data, companySettings, paymentLink, attachment } = req.body;
     if (!to || !template) {
@@ -1330,7 +1343,7 @@ app.post('/send-invoice', rateLimit(10, 60000), optionalAuth, async (req, res) =
 });
 
 // POST /send-weekly-update — Weekly service updates, job confirmations, job completions
-app.post('/send-weekly-update', rateLimit(10, 60000), optionalAuth, async (req, res) => {
+app.post('/send-weekly-update', rateLimit(10, 60000), authenticateUser, async (req, res) => {
   try {
     const { to, template, data, companySettings, paymentLink } = req.body;
     if (!to || !template) {
@@ -1357,7 +1370,7 @@ app.post('/send-weekly-update', rateLimit(10, 60000), optionalAuth, async (req, 
 });
 
 // POST /send-quote — Quote emails
-app.post('/send-quote', rateLimit(10, 60000), optionalAuth, async (req, res) => {
+app.post('/send-quote', rateLimit(10, 60000), authenticateUser, async (req, res) => {
   try {
     const { to, template, data, companySettings, attachment } = req.body;
     if (!to || !template) {
@@ -1393,7 +1406,7 @@ app.get('/', (req, res) => {
 });
 
 // Create a Stripe Checkout Session
-app.post('/api/create-checkout-session', async (req, res) => {
+app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
   try {
     const { 
       customerName, 
@@ -1412,8 +1425,9 @@ app.post('/api/create-checkout-session', async (req, res) => {
       return res.status(400).json({ error: 'Valid amount is required (between $0.01 and $999,999)' });
     }
 
-    // Create Stripe Checkout Session
+    // Create Stripe Checkout Session with idempotency key to prevent duplicate charges
     const unitAmount = Math.round((parsedAmount + Number.EPSILON) * 100); // Safe cent conversion
+    const idempotencyKey = `checkout_${invoiceNumber || ''}_${customerId || ''}_${unitAmount}_${Date.now()}`;
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [
@@ -1439,7 +1453,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
         invoiceNumber,
         description
       },
-    });
+    }, { idempotencyKey });
 
     // Store session info
     paymentSessions.set(session.id, {
@@ -1471,12 +1485,12 @@ app.post('/api/create-checkout-session', async (req, res) => {
 });
 
 // Create a Payment Link (reusable)
-app.post('/api/create-payment-link', async (req, res) => {
+app.post('/api/create-payment-link', optionalAuth, async (req, res) => {
   try {
     const { amount, description, invoiceNumber } = req.body;
 
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ error: 'Valid amount is required' });
+    if (!amount || typeof amount !== 'number' || !isFinite(amount) || amount <= 0 || amount > 999999.99) {
+      return res.status(400).json({ error: 'Valid amount is required (must be between $0.01 and $999,999.99)' });
     }
 
     // First create a price
@@ -1510,15 +1524,16 @@ app.post('/api/create-payment-link', async (req, res) => {
 
   } catch (error) {
     console.error('Error creating payment link:', error);
-    res.status(500).json({ 
+    const safeMessage = process.env.NODE_ENV === 'production' ? 'Failed to create payment link' : error.message;
+    res.status(500).json({
       error: 'Failed to create payment link',
-      message: error.message 
+      message: safeMessage
     });
   }
 });
 
 // Check payment status
-app.get('/api/payment-status/:sessionId', async (req, res) => {
+app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
   try {
     const { sessionId } = req.params;
     
@@ -1599,12 +1614,29 @@ async function handleStripeWebhook(req, res) {
 }
 
 // Get all payment sessions (for admin)
-app.get('/api/payments', (req, res) => {
+app.get('/api/payments', authenticateUser, (req, res) => {
   const payments = Array.from(paymentSessions.values());
   res.json({
     success: true,
     payments: payments.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
   });
+});
+
+// Global error handler — catch unhandled Express errors
+app.use((err, req, res, next) => {
+  console.error('Unhandled Express error:', err);
+  const safeMessage = process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message;
+  res.status(500).json({ error: safeMessage });
+});
+
+// Catch unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  process.exit(1);
 });
 
 // Start server
