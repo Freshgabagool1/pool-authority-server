@@ -146,7 +146,8 @@ setInterval(() => {
 // ============================================================
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const EMAIL_FROM = process.env.EMAIL_FROM || 'Pool Authority <onboarding@resend.dev>';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Pool Authority <noreply@poolauthoritymail.com>';
+const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || 'info@poolauthoritymail.com';
 
 // Process email template: replace {{variable}} placeholders and handle {{#if var}}...{{/if}} blocks
 const processTemplate = (template, data) => {
@@ -218,7 +219,7 @@ const sendEmail = async (to, subject, htmlBody, fromName, attachments) => {
   const emailMatch = EMAIL_FROM.match(/<([^>]+)>/);
   const fromAddress = emailMatch ? emailMatch[1] : EMAIL_FROM;
   const from = fromName ? `${fromName} <${fromAddress}>` : EMAIL_FROM;
-  const payload = { from, to: [to], subject, html: htmlBody };
+  const payload = { from, to: [to], subject, html: htmlBody, reply_to: EMAIL_REPLY_TO };
   if (attachments && attachments.length > 0) {
     payload.attachments = attachments;
   }
