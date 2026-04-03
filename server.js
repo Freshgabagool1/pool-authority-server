@@ -161,6 +161,8 @@ const processTemplate = (template, data) => {
   for (const [key, value] of Object.entries(data)) {
     result = result.replaceAll(`{{${key}}}`, escapeHtml(value) || '');
   }
+  // Strip any remaining unreplaced {{...}} placeholders
+  result = result.replace(/\{\{[^}]+\}\}/g, '');
   return result;
 };
 
@@ -1324,7 +1326,13 @@ app.post('/send-invoice', rateLimit(10, 60000), authenticateUser, async (req, re
     }
 
     const companyName = companySettings?.companyName || 'Pool Authority';
-    const allData = { ...data, company_name: companyName };
+    const allData = {
+      ...data,
+      company_name: companyName,
+      owner_name: companySettings?.ownerName || '',
+      company_phone: companySettings?.phone || '',
+      company_email: companySettings?.email || '',
+    };
     const subject = processTemplate(template.subject, allData);
     let body = processTemplate(template.body, allData);
 
@@ -1352,7 +1360,13 @@ app.post('/send-weekly-update', rateLimit(10, 60000), authenticateUser, async (r
     }
 
     const companyName = companySettings?.companyName || 'Pool Authority';
-    const allData = { ...data, company_name: companyName };
+    const allData = {
+      ...data,
+      company_name: companyName,
+      owner_name: companySettings?.ownerName || '',
+      company_phone: companySettings?.phone || '',
+      company_email: companySettings?.email || '',
+    };
     const subject = processTemplate(template.subject, allData);
     let body = processTemplate(template.body, allData);
 
@@ -1379,7 +1393,13 @@ app.post('/send-quote', rateLimit(10, 60000), authenticateUser, async (req, res)
     }
 
     const companyName = companySettings?.companyName || 'Pool Authority';
-    const allData = { ...data, company_name: companyName };
+    const allData = {
+      ...data,
+      company_name: companyName,
+      owner_name: companySettings?.ownerName || '',
+      company_phone: companySettings?.phone || '',
+      company_email: companySettings?.email || '',
+    };
     const subject = processTemplate(template.subject, allData);
     const body = processTemplate(template.body, allData);
 
