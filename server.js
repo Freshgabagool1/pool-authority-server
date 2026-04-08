@@ -1643,6 +1643,93 @@ app.get('/api/payments', authenticateUser, (req, res) => {
   });
 });
 
+// ============================================================
+// Signed Contract PDF Email
+// ============================================================
+
+const signedContractUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    cb(null, file.mimetype === 'application/pdf');
+  },
+});
+
+app.post('/api/send-signed-contract', rateLimit(10, 60000), signedContractUpload.single('pdf'), async (req, res) => {
+  try {
+    const { customerEmail, companyEmail, contractNumber, customerName, companyName } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: 'Missing PDF file' });
+    }
+    if (!customerEmail && !companyEmail) {
+      return res.status(400).json({ error: 'At least one email address required' });
+    }
+
+    const pdfBase64 = req.file.buffer.toString('base64');
+    const attachment = [{
+      filename: `contract-${contractNumber || 'signed'}.pdf`,
+      content: pdfBase64,
+    }];
+
+    const fromName = companyName || 'Pool Authority';
+    const results = [];
+
+    // Send to customer
+    if (customerEmail) {
+      try {
+        await sendEmail(
+          customerEmail,
+          `Your Signed Contract #${contractNumber}`,
+          `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto;">
+            <div style="background: linear-gradient(135deg, #1B3A5C 0%, #2d5a8e 100%); padding: 32px; text-align: center;">
+              <h1 style="color: white; margin: 0; font-size: 24px;">${fromName}</h1>
+            </div>
+            <div style="padding: 32px; background: white;">
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Hi ${customerName || 'there'},</p>
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Thank you for signing your agreement. A copy of your signed contract (#${contractNumber}) is attached to this email for your records.</p>
+              <p style="color: #6b7280; font-size: 14px;">If you have any questions, please don't hesitate to reach out.</p>
+            </div>
+          </div>`,
+          fromName,
+          attachment
+        );
+        results.push({ to: customerEmail, status: 'sent' });
+      } catch (e) {
+        results.push({ to: customerEmail, status: 'failed', error: e.message });
+      }
+    }
+
+    // Send to company
+    if (companyEmail) {
+      try {
+        await sendEmail(
+          companyEmail,
+          `Contract #${contractNumber} Signed by ${customerName || 'Customer'}`,
+          `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto;">
+            <div style="background: linear-gradient(135deg, #1B3A5C 0%, #2d5a8e 100%); padding: 32px; text-align: center;">
+              <h1 style="color: white; margin: 0; font-size: 24px;">${fromName}</h1>
+            </div>
+            <div style="padding: 32px; background: white;">
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Contract #${contractNumber} has been signed by <strong>${customerName || 'the customer'}</strong>.</p>
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">The signed PDF is attached to this email.</p>
+            </div>
+          </div>`,
+          fromName,
+          attachment
+        );
+        results.push({ to: companyEmail, status: 'sent' });
+      } catch (e) {
+        results.push({ to: companyEmail, status: 'failed', error: e.message });
+      }
+    }
+
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('Send signed contract error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Global error handler — catch unhandled Express errors
 app.use((err, req, res, next) => {
   console.error('Unhandled Express error:', err);
