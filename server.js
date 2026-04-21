@@ -189,6 +189,13 @@ const textToHtml = (text) => {
     .replace(/• /g, '&bull; ');
 };
 
+// Build a styled payment button for emails
+const buildPaymentButton = (url) => {
+  return `<div style="text-align:center;margin:24px 0;">
+<a href="${url}" target="_blank" style="display:inline-block;background:#2563eb;color:#ffffff;font-size:16px;font-weight:bold;padding:14px 36px;border-radius:8px;text-decoration:none;letter-spacing:0.5px;">Pay Now Securely</a>
+</div>`;
+};
+
 // Build photo HTML for embedding in emails
 const buildPhotosHtml = (photoUrls) => {
   if (!photoUrls || !Array.isArray(photoUrls) || photoUrls.length === 0) return '';
@@ -1359,14 +1366,25 @@ app.post('/send-invoice', rateLimit(10, 60000), authenticateUser, async (req, re
     const subject = processTemplate(template.subject, allData);
     let body = processTemplate(template.body, allData);
 
-    // Add payment link button if provided
-    if (paymentLink) {
-      body += `\n\n**Pay Online:**\n[Click here to pay securely](${paymentLink})`;
+    // If template didn't include {{payment_link}} placeholder, append it as fallback
+    if (paymentLink && !template.body?.includes('{{payment_link}}')) {
+      body += `\n\n[Click here to pay securely](${paymentLink})`;
     }
 
-    const htmlBody = buildEmailHtml(textToHtml(body), companySettings);
+    let htmlBody = textToHtml(body);
+    // Replace any escaped payment URL with a styled button
+    if (paymentLink) {
+      htmlBody = htmlBody.replace(
+        new RegExp(`<a href="${escapeHtml(paymentLink).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[^<]*</a>`, 'g'),
+        buildPaymentButton(paymentLink)
+      );
+      // Also replace the raw escaped URL text (if template just had {{payment_link}} without markdown link)
+      htmlBody = htmlBody.replaceAll(escapeHtml(paymentLink), buildPaymentButton(paymentLink));
+    }
+
+    const finalHtml = buildEmailHtml(htmlBody, companySettings);
     const attachments = attachment ? [{ filename: attachment.filename, content: attachment.content }] : undefined;
-    await sendEmail(to, subject, htmlBody, companyName, attachments);
+    await sendEmail(to, subject, finalHtml, companyName, attachments);
     res.json({ success: true, message: `Invoice email sent to ${to}` });
   } catch (error) {
     console.error('Send invoice error:', error.message);
@@ -1393,11 +1411,22 @@ app.post('/send-weekly-update', rateLimit(10, 60000), authenticateUser, async (r
     const subject = processTemplate(template.subject, allData);
     let body = processTemplate(template.body, allData);
 
-    if (paymentLink) {
-      body += `\n\n**Pay Online:**\n[Click here to pay securely](${paymentLink})`;
+    // If template didn't include {{payment_link}} placeholder, append it as fallback
+    if (paymentLink && !template.body?.includes('{{payment_link}}')) {
+      body += `\n\n[Click here to pay securely](${paymentLink})`;
     }
 
-    const bodyHtml = textToHtml(body) + buildPhotosHtml(data?.photo_urls);
+    let bodyHtml = textToHtml(body);
+    // Replace any escaped payment URL with a styled button
+    if (paymentLink) {
+      bodyHtml = bodyHtml.replace(
+        new RegExp(`<a href="${escapeHtml(paymentLink).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[^<]*</a>`, 'g'),
+        buildPaymentButton(paymentLink)
+      );
+      bodyHtml = bodyHtml.replaceAll(escapeHtml(paymentLink), buildPaymentButton(paymentLink));
+    }
+
+    bodyHtml += buildPhotosHtml(data?.photo_urls);
     const htmlBody = buildEmailHtml(bodyHtml, companySettings);
     await sendEmail(to, subject, htmlBody, companyName);
     res.json({ success: true, message: `Email sent to ${to}` });
