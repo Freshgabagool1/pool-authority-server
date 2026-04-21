@@ -258,6 +258,9 @@ const categorizePool360Item = (description) => {
     'pump lid','pump basket','filter lid','check valve',
     'salt cell','light gasket','lens gasket','grid set','grid element',
     'drain cap','end cap','hose section',
+    'seal','nozzle','brush','hose','tube','belt','tripper','vac head',
+    'test strip','reagent','test kit','comparator','dpd','phenol red',
+    'thermometer','skimmer sock','leaf rake','pole','telepole',
   ];
   if (wearKeywords.some(k => desc.includes(k))) return 'wear_item';
   // Equipment — capital items
@@ -348,8 +351,8 @@ const buildPool360Item = (productCode, catalogInfo, description, uomMatch, saved
     totalPrice: parseFloat(uomMatch[7]),
     itemName: savedMapping?.itemName || description || catalogInfo || `Product ${productCode}`,
     itemType: autoType,
-    usageUnit: savedMapping?.usageUnit || (autoType === 'chemical' ? autoUnit.unit : 'each'),
-    conversionFactor: savedMapping?.conversionFactor || (autoType === 'chemical' ? autoUnit.conversionFactor : 1),
+    usageUnit: savedMapping?.usageUnit || autoUnit.unit,
+    conversionFactor: savedMapping?.conversionFactor || autoUnit.conversionFactor,
     category: savedMapping?.category || '',
   };
 };
@@ -584,21 +587,28 @@ app.post('/api/process-pool360', async (req, res) => {
         }
         chemCount++;
       } else {
+        // Calculate actual quantity for wear items (cases/packs expand to individual units)
+        const actualWearQty = item.shippedQty * conversionFactor;
+        const wearCostPerUnit = conversionFactor > 1 ? item.unitPrice / conversionFactor : item.unitPrice;
+
         const existingWear = (existingWearItems || []).find(w =>
           w.name.toLowerCase() === itemName.toLowerCase()
         );
         if (existingWear) {
-          // Update existing wear item with latest price
+          const existingStock = existingWear.stock_quantity || 0;
+          existingWear.stock_quantity = existingStock + actualWearQty;
           await supabase.from('wear_items').update({
-            price: item.unitPrice,
-            description: `Pool360: ${item.productCode} | Qty: ${item.shippedQty}`,
+            price: wearCostPerUnit,
+            stock_quantity: existingWear.stock_quantity,
+            description: `Pool360: ${item.productCode} | ${actualWearQty} ${item.usageUnit}`,
           }).eq('id', existingWear.id);
         } else {
           const { data: insertedWear } = await supabase.from('wear_items').insert({
             org_id: orgId,
             name: itemName,
-            price: item.unitPrice,
-            description: `Pool360: ${item.productCode} | Qty: ${item.shippedQty}`,
+            price: wearCostPerUnit,
+            stock_quantity: actualWearQty,
+            description: `Pool360: ${item.productCode} | ${actualWearQty} ${item.usageUnit}`,
           }).select().single();
           if (insertedWear) existingWearItems.push(insertedWear);
         }
@@ -1429,15 +1439,16 @@ app.get('/', (req, res) => {
 // Create a Stripe Checkout Session
 app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
   try {
-    const { 
-      customerName, 
-      customerEmail, 
-      amount, 
-      description, 
+    const {
+      customerName,
+      customerEmail,
+      amount,
+      description,
       invoiceNumber,
       customerId,
+      companyName,
       successUrl,
-      cancelUrl 
+      cancelUrl
     } = req.body;
 
     // Validate required fields
@@ -1448,7 +1459,13 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
 
     // Create Stripe Checkout Session with idempotency key to prevent duplicate charges
     const unitAmount = Math.round((parsedAmount + Number.EPSILON) * 100); // Safe cent conversion
-    const idempotencyKey = `checkout_${invoiceNumber || ''}_${customerId || ''}_${unitAmount}_${Date.now()}`;
+    const idempotencyKey = `checkout_${invoiceNumber || ''}_${customerId || ''}_${unitAmount}`;
+
+    // Build server-hosted success/cancel URLs as defaults
+    const serverOrigin = `${req.protocol}://${req.get('host')}`;
+    const defaultSuccessUrl = `${serverOrigin}/payment-success?session_id={CHECKOUT_SESSION_ID}`;
+    const defaultCancelUrl = `${serverOrigin}/payment-cancelled`;
+
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [
@@ -1465,14 +1482,16 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
         },
       ],
       mode: 'payment',
-      success_url: successUrl || 'https://pool-authority.vercel.app/payment-success?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: cancelUrl || 'https://pool-authority.vercel.app/payment-cancelled',
+      success_url: successUrl || defaultSuccessUrl,
+      cancel_url: cancelUrl || defaultCancelUrl,
       customer_email: customerEmail || undefined,
       metadata: {
         customerName,
         customerId,
         invoiceNumber,
-        description
+        description,
+        companyName,
+        billingMonth: req.body.billingMonth || '',
       },
     }, { idempotencyKey });
 
@@ -1611,12 +1630,112 @@ async function handleStripeWebhook(req, res) {
         metadata: session.metadata
       });
 
-      // Update payment session status
+      // Update payment session status (in-memory cache)
       if (paymentSessions.has(session.id)) {
         const paymentSession = paymentSessions.get(session.id);
         paymentSession.status = 'paid';
         paymentSession.paidAt = new Date().toISOString();
         paymentSessions.set(session.id, paymentSession);
+      }
+
+      // Mark invoice as paid in Supabase
+      if (supabase && session.metadata?.invoiceNumber) {
+        try {
+          const paidAt = new Date().toISOString();
+          const amountPaid = session.amount_total / 100;
+
+          // Update invoices table by invoice_number
+          const { data: updatedInvoices } = await supabase
+            .from('invoices')
+            .update({
+              status: 'paid',
+              payment_date: paidAt,
+              payment_method: 'stripe',
+              amount_paid: amountPaid,
+              stripe_payment_intent: session.payment_intent || '',
+            })
+            .eq('invoice_number', session.metadata.invoiceNumber)
+            .select('org_id, customer_id');
+
+          // Update org paid_invoices for billing tab (keyed by customerId-YYYY-MM)
+          const orgId = updatedInvoices?.[0]?.org_id;
+          const customerId = session.metadata.customerId || updatedInvoices?.[0]?.customer_id;
+          const billingMonth = session.metadata.billingMonth;
+
+          if (orgId && customerId && billingMonth) {
+            const invoiceKey = `${customerId}-${billingMonth}`;
+            const { data: org } = await supabase
+              .from('organizations')
+              .select('settings')
+              .eq('id', orgId)
+              .single();
+
+            if (org) {
+              const existingPaidInvoices = org.settings?.paidInvoices || {};
+              existingPaidInvoices[invoiceKey] = {
+                paid: true,
+                method: 'electronic',
+                source: 'Stripe',
+                paidDate: paidAt,
+                amount: amountPaid,
+              };
+              await supabase
+                .from('organizations')
+                .update({ settings: { ...org.settings, paidInvoices: existingPaidInvoices } })
+                .eq('id', orgId);
+            }
+          }
+
+          console.log(`Invoice ${session.metadata.invoiceNumber} marked as paid in Supabase`);
+        } catch (dbErr) {
+          console.error('Failed to update invoice in Supabase:', dbErr.message);
+        }
+      }
+
+      // Send payment receipt email
+      if (session.customer_email) {
+        try {
+          const amount = (session.amount_total / 100).toFixed(2);
+          const customerName = session.metadata?.customerName || 'Valued Customer';
+          const companyName = session.metadata?.companyName || 'Pool Authority';
+          const invoiceRef = session.metadata?.invoiceNumber || session.metadata?.description || '';
+          const receiptHtml = buildEmailHtml(`
+            <h2 style="color:#1e3a5f;margin-top:0;">Payment Received — Thank You!</h2>
+            <p>Hi ${escapeHtml(customerName)},</p>
+            <p>We've received your payment. Here are the details:</p>
+            <table style="width:100%;border-collapse:collapse;margin:20px 0;">
+              <tr style="border-bottom:1px solid #eee;">
+                <td style="padding:10px 0;color:#666;">Amount Paid</td>
+                <td style="padding:10px 0;text-align:right;font-weight:bold;font-size:18px;color:#1e3a5f;">$${amount}</td>
+              </tr>
+              <tr style="border-bottom:1px solid #eee;">
+                <td style="padding:10px 0;color:#666;">Date</td>
+                <td style="padding:10px 0;text-align:right;">${new Date().toLocaleDateString()}</td>
+              </tr>
+              ${invoiceRef ? `<tr style="border-bottom:1px solid #eee;">
+                <td style="padding:10px 0;color:#666;">Reference</td>
+                <td style="padding:10px 0;text-align:right;">${escapeHtml(invoiceRef)}</td>
+              </tr>` : ''}
+              <tr>
+                <td style="padding:10px 0;color:#666;">Transaction ID</td>
+                <td style="padding:10px 0;text-align:right;font-size:12px;color:#888;">${session.id}</td>
+              </tr>
+            </table>
+            <p>If you have any questions about this payment, please don't hesitate to reach out.</p>
+            <p>Thank you for your business!</p>
+          `, { companyName });
+
+          await sendEmail(
+            session.customer_email,
+            `Payment Receipt — $${amount} — ${companyName}`,
+            receiptHtml,
+            companyName
+          );
+          console.log(`Payment receipt email sent to ${session.customer_email}`);
+        } catch (emailErr) {
+          console.error('Failed to send payment receipt email:', emailErr.message);
+          // Don't fail the webhook response for email errors
+        }
       }
       break;
     }
@@ -1633,6 +1752,81 @@ async function handleStripeWebhook(req, res) {
 
   res.json({ received: true });
 }
+
+// Payment success page — customers are redirected here after paying via Stripe
+app.get('/payment-success', async (req, res) => {
+  const sessionId = req.query.session_id;
+  let amount = '';
+  let customerName = 'Valued Customer';
+  let invoiceRef = '';
+
+  if (sessionId && stripe) {
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      amount = (session.amount_total / 100).toFixed(2);
+      customerName = session.metadata?.customerName || customerName;
+      invoiceRef = session.metadata?.invoiceNumber || '';
+    } catch (e) {
+      console.error('Error retrieving session for success page:', e.message);
+    }
+  }
+
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment Successful - Pool Authority</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1e3a5f 0%,#2563eb 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.2);max-width:480px;width:100%;padding:48px 36px;text-align:center}
+  .check{width:80px;height:80px;background:#22c55e;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 24px}
+  .check svg{width:40px;height:40px;color:#fff}
+  h1{color:#1e3a5f;font-size:24px;margin-bottom:8px}
+  .subtitle{color:#64748b;font-size:16px;margin-bottom:24px}
+  .details{background:#f8fafc;border-radius:12px;padding:20px;margin-bottom:24px;text-align:left}
+  .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #e2e8f0}
+  .row:last-child{border:none}
+  .label{color:#64748b;font-size:14px}
+  .value{color:#1e3a5f;font-weight:600;font-size:14px}
+  .amount{font-size:18px}
+  .note{color:#94a3b8;font-size:13px;margin-top:16px}
+</style></head><body>
+<div class="card">
+  <div class="check"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg></div>
+  <h1>Payment Successful!</h1>
+  <p class="subtitle">Thank you${customerName !== 'Valued Customer' ? ', ' + customerName.split(' ')[0] : ''}! Your payment has been received.</p>
+  ${amount ? `<div class="details">
+    <div class="row"><span class="label">Amount Paid</span><span class="value amount">$${amount}</span></div>
+    ${invoiceRef ? `<div class="row"><span class="label">Reference</span><span class="value">${invoiceRef}</span></div>` : ''}
+    <div class="row"><span class="label">Date</span><span class="value">${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</span></div>
+  </div>` : ''}
+  <p class="note">A receipt has been sent to your email. You may close this page.</p>
+</div>
+</body></html>`);
+});
+
+// Payment cancelled page
+app.get('/payment-cancelled', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment Cancelled - Pool Authority</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1e3a5f 0%,#2563eb 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.2);max-width:480px;width:100%;padding:48px 36px;text-align:center}
+  .icon{width:80px;height:80px;background:#f59e0b;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 24px}
+  .icon svg{width:40px;height:40px;color:#fff}
+  h1{color:#1e3a5f;font-size:24px;margin-bottom:8px}
+  .subtitle{color:#64748b;font-size:16px;margin-bottom:16px}
+  .note{color:#94a3b8;font-size:13px}
+</style></head><body>
+<div class="card">
+  <div class="icon"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M6 18L18 6M6 6l12 12"/></svg></div>
+  <h1>Payment Cancelled</h1>
+  <p class="subtitle">No charge was made. If you'd like to try again, please use the payment link from your invoice email.</p>
+  <p class="note">You may close this page.</p>
+</div>
+</body></html>`);
+});
 
 // Get all payment sessions (for admin)
 app.get('/api/payments', authenticateUser, (req, res) => {
@@ -1762,6 +1956,8 @@ Endpoints:
 - GET  /api/payment-status/:sessionId - Check payment status
 - POST /api/webhook - Stripe webhook handler
 - GET  /api/payments - List all payments
+- GET  /payment-success - Customer payment success page
+- GET  /payment-cancelled - Customer payment cancelled page
 - POST /api/process-pool360 - Auto-import Pool360 PDF
 - POST /api/tech-assist - AI diagnostic assistant
 - POST /api/tech-assist/rate - Rate diagnostic session
