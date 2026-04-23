@@ -139,16 +139,19 @@ const generateShortCode = () => {
   for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
   return code;
 };
-// Clean up old payment sessions every hour (prevent memory leak)
+// Clean up old in-memory caches every hour (prevent memory leak)
+// Short links resolve from Supabase if evicted, so this is safe
 setInterval(() => {
-  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
   for (const [id, session] of paymentSessions) {
-    if (new Date(session.createdAt).getTime() < oneDayAgo) {
+    if (new Date(session.createdAt).getTime() < oneWeekAgo) {
       paymentSessions.delete(id);
     }
   }
+  // Only evict from memory cache after 30 days — links stay valid via Supabase fallback
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
   for (const [code, link] of shortLinks) {
-    if (new Date(link.createdAt).getTime() < oneDayAgo) {
+    if (new Date(link.createdAt).getTime() < thirtyDaysAgo) {
       shortLinks.delete(code);
     }
   }
@@ -1499,62 +1502,58 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'Valid amount is required (between $0.01 and $999,999)' });
     }
 
-    // Create Stripe Checkout Session with idempotency key to prevent duplicate charges
+    // Use Stripe Payment Links (never expire) instead of Checkout Sessions (24h max)
     const unitAmount = Math.round((parsedAmount + Number.EPSILON) * 100); // Safe cent conversion
-    const idempotencyKey = `checkout_${invoiceNumber || ''}_${customerId || ''}_${unitAmount}`;
 
-    // Build server-hosted success/cancel URLs as defaults
+    // Build server-hosted success URL
     const serverOrigin = `${req.protocol}://${req.get('host')}`;
     const defaultSuccessUrl = `${serverOrigin}/payment-success?session_id={CHECKOUT_SESSION_ID}`;
-    const defaultCancelUrl = `${serverOrigin}/payment-cancelled`;
 
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price_data: {
-            currency: 'usd',
-            product_data: {
-              name: description || 'Pool Authority Service',
-              description: `Invoice #${invoiceNumber || 'N/A'}`,
-            },
-            unit_amount: unitAmount,
-          },
-          quantity: 1,
-        },
-      ],
-      mode: 'payment',
-      success_url: successUrl || defaultSuccessUrl,
-      cancel_url: cancelUrl || defaultCancelUrl,
-      customer_email: customerEmail || undefined,
+    // Create a one-time price for this invoice
+    const price = await stripe.prices.create({
+      currency: 'usd',
+      unit_amount: unitAmount,
+      product_data: {
+        name: description || 'Pool Authority Service',
+        metadata: { invoiceNumber: invoiceNumber || '' },
+      },
+    });
+
+    // Create a Payment Link (never expires, generates fresh checkout session per click)
+    const paymentLink = await stripe.paymentLinks.create({
+      line_items: [{ price: price.id, quantity: 1 }],
+      after_completion: {
+        type: 'redirect',
+        redirect: { url: successUrl || defaultSuccessUrl },
+      },
       metadata: {
-        customerName,
-        customerId,
-        invoiceNumber,
-        description,
-        companyName,
+        customerName: customerName || '',
+        customerId: customerId || '',
+        invoiceNumber: invoiceNumber || '',
+        description: description || '',
+        companyName: companyName || '',
         billingMonth: req.body.billingMonth || '',
       },
-    }, { idempotencyKey });
+    });
 
     // Generate short link
     const shortCode = generateShortCode();
     const serverOriginForLink = `${req.protocol}://${req.get('host')}`;
     const shortUrl = `${serverOriginForLink}/pay/${shortCode}`;
-    shortLinks.set(shortCode, { paymentUrl: session.url, sessionId: session.id, createdAt: new Date().toISOString() });
+    shortLinks.set(shortCode, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
 
     // Persist short link to Supabase for durability across server restarts
-    if (supabase && session.metadata?.invoiceNumber) {
+    if (supabase && invoiceNumber) {
       supabase.from('invoices')
-        .update({ stripe_payment_link: shortUrl })
-        .eq('invoice_number', session.metadata.invoiceNumber)
+        .update({ stripe_payment_link: shortUrl, stripe_invoice_id: paymentLink.id })
+        .eq('invoice_number', invoiceNumber)
         .then(() => {})
         .catch(e => console.error('Short link persist error:', e));
     }
 
     // Store session info
-    paymentSessions.set(session.id, {
-      id: session.id,
+    paymentSessions.set(paymentLink.id, {
+      id: paymentLink.id,
       customerName,
       customerEmail,
       customerId,
@@ -1562,15 +1561,15 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
       invoiceNumber,
       status: 'pending',
       createdAt: new Date().toISOString(),
-      paymentUrl: session.url,
+      paymentUrl: paymentLink.url,
       shortCode
     });
 
     res.json({
       success: true,
-      sessionId: session.id,
+      sessionId: paymentLink.id,
       paymentUrl: shortUrl,
-      fullPaymentUrl: session.url,
+      fullPaymentUrl: paymentLink.url,
       invoiceNumber
     });
 
@@ -1695,6 +1694,13 @@ async function handleStripeWebhook(req, res) {
         paymentSession.status = 'paid';
         paymentSession.paidAt = new Date().toISOString();
         paymentSessions.set(session.id, paymentSession);
+      }
+
+      // Deactivate the Payment Link so customer can't pay twice
+      if (session.payment_link) {
+        stripe.paymentLinks.update(session.payment_link, { active: false })
+          .then(() => console.log(`Deactivated payment link ${session.payment_link}`))
+          .catch(e => console.error('Failed to deactivate payment link:', e.message));
       }
 
       // Mark invoice as paid in Supabase
@@ -1834,12 +1840,24 @@ app.get('/pay/:code', async (req, res) => {
         .single();
 
       if (data?.stripe_invoice_id) {
-        // Retrieve the live Stripe session URL
-        const session = await stripe.checkout.sessions.retrieve(data.stripe_invoice_id);
-        if (session?.url) {
-          // Re-cache for future hits
-          shortLinks.set(code, { paymentUrl: session.url, sessionId: session.id, createdAt: new Date().toISOString() });
-          return res.redirect(303, session.url);
+        try {
+          // Try as Payment Link first (never expires)
+          const paymentLink = await stripe.paymentLinks.retrieve(data.stripe_invoice_id);
+          if (paymentLink?.url && paymentLink.active) {
+            shortLinks.set(code, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
+            return res.redirect(303, paymentLink.url);
+          }
+        } catch (plErr) {
+          // Not a payment link — try as checkout session (legacy)
+          try {
+            const session = await stripe.checkout.sessions.retrieve(data.stripe_invoice_id);
+            if (session?.url) {
+              shortLinks.set(code, { paymentUrl: session.url, sessionId: session.id, createdAt: new Date().toISOString() });
+              return res.redirect(303, session.url);
+            }
+          } catch (csErr) {
+            console.error('Short link lookup - neither payment link nor session:', csErr.message);
+          }
         }
       }
     } catch (e) {
@@ -1847,11 +1865,11 @@ app.get('/pay/:code', async (req, res) => {
     }
   }
 
-  res.status(404).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Link Expired</title>
+  res.status(404).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Link Not Found</title>
 <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f1f5f9;margin:0}
 .card{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:400px}
 h1{color:#1e3a5f;font-size:20px}p{color:#64748b;font-size:14px}</style></head>
-<body><div class="card"><h1>Payment Link Expired</h1><p>This payment link is no longer active. Please contact your pool service provider for a new link.</p></div></body></html>`);
+<body><div class="card"><h1>Payment Link Not Found</h1><p>This payment link is no longer active. Please contact your pool service provider for a new link.</p></div></body></html>`);
 });
 
 // Payment success page — customers are redirected here after paying via Stripe
