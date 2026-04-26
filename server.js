@@ -1493,7 +1493,8 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
       customerId,
       companyName,
       successUrl,
-      cancelUrl
+      cancelUrl,
+      invoiceId,
     } = req.body;
 
     // Validate required fields
@@ -1530,6 +1531,7 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
         customerName: customerName || '',
         customerId: customerId || '',
         invoiceNumber: invoiceNumber || '',
+        invoiceId: invoiceId || '',
         description: description || '',
         companyName: companyName || '',
         billingMonth: req.body.billingMonth || '',
