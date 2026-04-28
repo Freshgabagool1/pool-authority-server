@@ -1632,13 +1632,34 @@ app.post('/api/create-payment-link', optionalAuth, async (req, res) => {
   }
 });
 
-// Check payment status
+// Check payment status (supports both Checkout Session IDs and Payment Link IDs)
 app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
   try {
     const { sessionId } = req.params;
-    
+
+    // Payment Link IDs start with "plink_" — look up completed checkout sessions for this link
+    if (sessionId.startsWith('plink_')) {
+      const sessions = await stripe.checkout.sessions.list({
+        payment_link: sessionId,
+        limit: 1,
+      });
+      if (sessions.data.length > 0) {
+        const session = sessions.data[0];
+        return res.json({
+          success: true,
+          status: session.payment_status,
+          amountTotal: session.amount_total / 100,
+          customerEmail: session.customer_email,
+          metadata: session.metadata
+        });
+      }
+      // No sessions yet — payment link exists but hasn't been used
+      return res.json({ success: true, status: 'unpaid' });
+    }
+
+    // Regular Checkout Session ID
     const session = await stripe.checkout.sessions.retrieve(sessionId);
-    
+
     res.json({
       success: true,
       status: session.payment_status,
@@ -1649,9 +1670,9 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
 
   } catch (error) {
     console.error('Error checking payment status:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to check payment status',
-      message: error.message 
+      message: error.message
     });
   }
 });
