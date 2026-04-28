@@ -1375,14 +1375,12 @@ app.post('/send-invoice', rateLimit(10, 60000), authenticateUser, async (req, re
     }
 
     let htmlBody = textToHtml(body);
-    // Replace any escaped payment URL with a styled button
+    // Replace any payment link <a> tag with a styled button
     if (paymentLink) {
       htmlBody = htmlBody.replace(
         new RegExp(`<a href="${escapeHtml(paymentLink).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[^<]*</a>`, 'g'),
         buildPaymentButton(paymentLink)
       );
-      // Also replace the raw escaped URL text (if template just had {{payment_link}} without markdown link)
-      htmlBody = htmlBody.replaceAll(escapeHtml(paymentLink), buildPaymentButton(paymentLink));
     }
 
     const finalHtml = buildEmailHtml(htmlBody, companySettings);
@@ -1420,13 +1418,12 @@ app.post('/send-weekly-update', rateLimit(10, 60000), authenticateUser, async (r
     }
 
     let bodyHtml = textToHtml(body);
-    // Replace any escaped payment URL with a styled button
+    // Replace any payment link <a> tag with a styled button
     if (paymentLink) {
       bodyHtml = bodyHtml.replace(
         new RegExp(`<a href="${escapeHtml(paymentLink).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[^<]*</a>`, 'g'),
         buildPaymentButton(paymentLink)
       );
-      bodyHtml = bodyHtml.replaceAll(escapeHtml(paymentLink), buildPaymentButton(paymentLink));
     }
 
     bodyHtml += buildPhotosHtml(data?.photo_urls);
