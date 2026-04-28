@@ -194,8 +194,9 @@ const textToHtml = (text) => {
 
 // Build a styled payment button for emails
 const buildPaymentButton = (url) => {
-  return `<div style="text-align:center;margin:24px 0;">
-<a href="${url}" target="_blank" style="display:inline-block;background:#2563eb;color:#ffffff;font-size:16px;font-weight:bold;padding:14px 36px;border-radius:8px;text-decoration:none;letter-spacing:0.5px;">Pay Now Securely</a>
+  return `<div style="text-align:center;margin:28px 0;">
+<a href="${url}" target="_blank" style="display:inline-block;background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#ffffff;font-size:17px;font-weight:bold;padding:16px 48px;border-radius:8px;text-decoration:none;letter-spacing:0.5px;box-shadow:0 4px 14px rgba(37,99,235,0.4);border:none;cursor:pointer;">&#128274; Pay Now Securely</a>
+<p style="margin:10px 0 0;font-size:12px;color:#6b7280;">Secure payment powered by <strong>Stripe</strong> &mdash; all major cards accepted</p>
 </div>`;
 };
 
