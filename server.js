@@ -1543,12 +1543,20 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
     shortLinks.set(shortCode, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
 
     // Persist short link to Supabase for durability across server restarts
+    // 1. Store in dedicated short_links table (primary — always works)
+    if (supabase) {
+      supabase.from('short_links')
+        .upsert({ code: shortCode, payment_link_id: paymentLink.id, payment_url: paymentLink.url, created_at: new Date().toISOString() })
+        .then(() => {})
+        .catch(e => console.error('Short link persist error:', e));
+    }
+    // 2. Also update invoices table if invoice row exists (best effort)
     if (supabase && invoiceNumber) {
       supabase.from('invoices')
         .update({ stripe_payment_link: shortUrl, stripe_invoice_id: paymentLink.id })
         .eq('invoice_number', invoiceNumber)
         .then(() => {})
-        .catch(e => console.error('Short link persist error:', e));
+        .catch(e => console.error('Invoice link update error:', e));
     }
 
     // Store session info
@@ -1849,7 +1857,33 @@ app.get('/pay/:code', async (req, res) => {
     return res.redirect(303, cached.paymentUrl);
   }
 
-  // Fallback: look up in Supabase by the short URL pattern
+  // Fallback 1: look up in short_links table (reliable — persisted at creation time)
+  if (supabase) {
+    try {
+      const { data: linkData } = await supabase
+        .from('short_links')
+        .select('payment_link_id, payment_url')
+        .eq('code', code)
+        .limit(1)
+        .single();
+
+      if (linkData?.payment_link_id) {
+        try {
+          const paymentLink = await stripe.paymentLinks.retrieve(linkData.payment_link_id);
+          if (paymentLink?.url && paymentLink.active) {
+            shortLinks.set(code, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
+            return res.redirect(303, paymentLink.url);
+          }
+        } catch (plErr) {
+          console.error('Short link - payment link inactive or invalid:', plErr.message);
+        }
+      }
+    } catch (e) {
+      // Table may not exist yet or no match — fall through to invoices lookup
+    }
+  }
+
+  // Fallback 2: look up in invoices table by short URL pattern (legacy)
   if (supabase) {
     try {
       const shortUrl = `%/pay/${code}`;
@@ -1862,14 +1896,12 @@ app.get('/pay/:code', async (req, res) => {
 
       if (data?.stripe_invoice_id) {
         try {
-          // Try as Payment Link first (never expires)
           const paymentLink = await stripe.paymentLinks.retrieve(data.stripe_invoice_id);
           if (paymentLink?.url && paymentLink.active) {
             shortLinks.set(code, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
             return res.redirect(303, paymentLink.url);
           }
         } catch (plErr) {
-          // Not a payment link — try as checkout session (legacy)
           try {
             const session = await stripe.checkout.sessions.retrieve(data.stripe_invoice_id);
             if (session?.url) {
