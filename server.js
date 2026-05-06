@@ -1480,7 +1480,7 @@ app.get('/', (req, res) => {
 });
 
 // Create a Stripe Checkout Session
-app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
+app.post('/api/create-checkout-session', authenticateUser, async (req, res) => {
   try {
     const {
       customerName,
@@ -1591,7 +1591,7 @@ app.post('/api/create-checkout-session', optionalAuth, async (req, res) => {
 });
 
 // Create a Payment Link (reusable)
-app.post('/api/create-payment-link', optionalAuth, async (req, res) => {
+app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
   try {
     const { amount, description, invoiceNumber } = req.body;
 
@@ -1718,11 +1718,12 @@ async function handleStripeWebhook(req, res) {
       });
 
       // Update payment session status (in-memory cache)
-      if (paymentSessions.has(session.id)) {
-        const paymentSession = paymentSessions.get(session.id);
+      const cacheKey = session.payment_link || session.id;
+      if (paymentSessions.has(cacheKey)) {
+        const paymentSession = paymentSessions.get(cacheKey);
         paymentSession.status = 'paid';
         paymentSession.paidAt = new Date().toISOString();
-        paymentSessions.set(session.id, paymentSession);
+        paymentSessions.set(cacheKey, paymentSession);
       }
 
       // Deactivate the Payment Link so customer can't pay twice
@@ -1735,11 +1736,23 @@ async function handleStripeWebhook(req, res) {
       // Mark invoice as paid in Supabase
       if (supabase && session.metadata?.invoiceNumber) {
         try {
+          // Check if already processed (idempotency)
+          const { data: existingInvoice } = await supabase
+            .from('invoices')
+            .select('status')
+            .eq('invoice_number', session.metadata.invoiceNumber)
+            .single();
+
+          if (existingInvoice?.status === 'paid') {
+            console.log(`Invoice ${session.metadata.invoiceNumber} already paid — skipping`);
+            break;
+          }
+
           const paidAt = new Date().toISOString();
           const amountPaid = session.amount_total / 100;
 
           // Update invoices table by invoice_number
-          const { data: updatedInvoices } = await supabase
+          const { data: updatedInvoices, error: invoiceUpdateError } = await supabase
             .from('invoices')
             .update({
               status: 'paid',
@@ -1750,6 +1763,8 @@ async function handleStripeWebhook(req, res) {
             })
             .eq('invoice_number', session.metadata.invoiceNumber)
             .select('org_id, customer_id');
+
+          if (invoiceUpdateError) console.error('Failed to mark invoice paid:', invoiceUpdateError.message);
 
           // Update org paid_invoices for billing tab (keyed by customerId-YYYY-MM)
           const orgId = updatedInvoices?.[0]?.org_id;
@@ -1837,6 +1852,14 @@ async function handleStripeWebhook(req, res) {
     case 'payment_intent.payment_failed': {
       const failedPayment = event.data.object;
       console.log('Payment failed:', failedPayment.id);
+      // Update invoice status if we can identify it
+      if (supabase && failedPayment.metadata?.invoiceNumber) {
+        await supabase
+          .from('invoices')
+          .update({ status: 'payment_failed' })
+          .eq('invoice_number', failedPayment.metadata.invoiceNumber)
+          .eq('status', 'pending');
+      }
       break;
     }
 
