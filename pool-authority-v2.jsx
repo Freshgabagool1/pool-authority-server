@@ -64,7 +64,10 @@ export default function PoolAuthority() {
   const [showMap, setShowMap] = useState(false);
   const [selectedDate, setSelectedDate] = useState(toLocalDateStr());
   const [calendarDate, setCalendarDate] = useState(new Date());
-  const [invoiceMonth, setInvoiceMonth] = useState(toLocalDateStr().slice(0, 7));
+  const [invoiceMonth, setInvoiceMonth] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  });
   const [showCustomInvoice, setShowCustomInvoice] = useState(false);
   const [showCreateQuote, setShowCreateQuote] = useState(false);
   const [quotes, setQuotes] = useState([]);
@@ -88,6 +91,9 @@ export default function PoolAuthority() {
 
   // Editing service history entry
   const [editingService, setEditingService] = useState(null);
+
+  // Billing tab - expanded customer for editing weekly services
+  const [billingDetailCustomer, setBillingDetailCustomer] = useState(null);
 
   // Controlled state for recurring service form (replaces document.getElementById)
   const [recurringForm, setRecurringForm] = useState({
@@ -655,6 +661,7 @@ export default function PoolAuthority() {
           description: description,
           invoiceNumber: invoiceNumber,
           customerId: customer.id.toString(),
+          companyName: companySettings.companyName,
           successUrl: window.location.origin + '/payment-success',
           cancelUrl: window.location.origin + '/payment-cancelled'
         }),
@@ -3046,10 +3053,22 @@ export default function PoolAuthority() {
                     return (
                       <tr key={customer.id} className="hover:bg-gray-50">
                         <td className="px-6 py-4">
-                          <div className="font-medium text-gray-800">{customer.name}</div>
+                          <div
+                            className="font-medium text-blue-600 hover:text-blue-800 cursor-pointer hover:underline"
+                            onClick={() => setBillingDetailCustomer({ customer, services })}
+                          >
+                            {customer.name}
+                          </div>
                           <div className="text-sm text-gray-500">{customer.address}</div>
                         </td>
-                        <td className="px-6 py-4 text-gray-600">{services.length} services</td>
+                        <td className="px-6 py-4">
+                          <span
+                            className="text-gray-600 cursor-pointer hover:text-blue-600 hover:underline"
+                            onClick={() => setBillingDetailCustomer({ customer, services })}
+                          >
+                            {services.length} services
+                          </span>
+                        </td>
                         <td className="px-6 py-4 font-bold text-green-600">${total.toFixed(2)}</td>
                         <td className="px-6 py-4 text-right">
                           <div className="flex gap-2 justify-end">
@@ -3234,6 +3253,143 @@ export default function PoolAuthority() {
                   className="w-full py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
                 >
                   Save Changes
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Billing Detail Modal - Edit Weekly Services */}
+        {billingDetailCustomer && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={(e) => { if (e.target === e.currentTarget) setBillingDetailCustomer(null); }}>
+            <div className="bg-white rounded-xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+              <div className="flex justify-between items-center mb-4">
+                <div>
+                  <h3 className="text-xl font-bold text-gray-800">{billingDetailCustomer.customer.name}</h3>
+                  <p className="text-sm text-gray-500">
+                    Services for {new Date(invoiceMonth + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                  </p>
+                </div>
+                <button onClick={() => setBillingDetailCustomer(null)} className="text-gray-500 hover:text-gray-700">
+                  <Icons.X />
+                </button>
+              </div>
+
+              {billingDetailCustomer.services.length > 0 ? (
+                <div className="space-y-3 mb-6">
+                  {billingDetailCustomer.services.map(service => (
+                    <div key={service.id} className="border rounded-lg p-4">
+                      <div className="flex justify-between items-start mb-3">
+                        <div>
+                          <div className="font-medium">{new Date(service.date).toLocaleDateString()}</div>
+                          <div className="text-sm text-gray-500">{service.poolType}</div>
+                        </div>
+                        <div className="text-right">
+                          <div className="font-bold text-green-600">${service.totalAmount.toFixed(2)}</div>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs text-gray-500 mb-1">Service Rate ($)</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            defaultValue={service.weeklyRate}
+                            className="w-full px-3 py-2 border rounded-lg text-sm"
+                            onBlur={(e) => {
+                              const newRate = parseFloat(e.target.value);
+                              if (!isNaN(newRate) && newRate !== service.weeklyRate) {
+                                const chemCost = service.chemicalCost || 0;
+                                const updated = { ...service, weeklyRate: newRate, totalAmount: newRate + chemCost };
+                                saveHistory(serviceHistory.map(s => s.id === service.id ? updated : s));
+                                const refreshed = getMonthServices(billingDetailCustomer.customer.id, invoiceMonth);
+                                setBillingDetailCustomer(prev => ({ ...prev, services: refreshed }));
+                              }
+                            }}
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-gray-500 mb-1">Chemical Cost ($)</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            defaultValue={service.chemicalCost || 0}
+                            className="w-full px-3 py-2 border rounded-lg text-sm"
+                            onBlur={(e) => {
+                              const newChem = parseFloat(e.target.value) || 0;
+                              if (newChem !== (service.chemicalCost || 0)) {
+                                const updated = { ...service, chemicalCost: newChem, totalAmount: service.weeklyRate + newChem };
+                                saveHistory(serviceHistory.map(s => s.id === service.id ? updated : s));
+                                const refreshed = getMonthServices(billingDetailCustomer.customer.id, invoiceMonth);
+                                setBillingDetailCustomer(prev => ({ ...prev, services: refreshed }));
+                              }
+                            }}
+                          />
+                        </div>
+                      </div>
+                      <div className="flex gap-2 mt-3 pt-2 border-t">
+                        <button
+                          onClick={() => {
+                            setEditingService(service);
+                            setBillingDetailCustomer(null);
+                          }}
+                          className="px-3 py-1 bg-blue-600 text-white rounded text-xs hover:bg-blue-700"
+                        >
+                          Full Edit
+                        </button>
+                        <button
+                          onClick={() => {
+                            showConfirm('Delete Service', 'Delete this service record?', () => {
+                              saveHistory(serviceHistory.filter(s => s.id !== service.id));
+                              const refreshed = getMonthServices(billingDetailCustomer.customer.id, invoiceMonth);
+                              setBillingDetailCustomer(prev => ({ ...prev, services: refreshed }));
+                            });
+                          }}
+                          className="px-3 py-1 bg-red-100 text-red-600 rounded text-xs hover:bg-red-200"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-gray-500 text-center py-8">No services recorded this month</p>
+              )}
+
+              {/* Summary */}
+              <div className="bg-gray-50 p-4 rounded-lg mb-4">
+                <div className="flex justify-between font-bold text-lg">
+                  <span>Monthly Total</span>
+                  <span className="text-green-600">
+                    ${billingDetailCustomer.services.reduce((sum, s) => sum + s.totalAmount, 0).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between text-sm text-gray-500 mt-1">
+                  <span>{billingDetailCustomer.services.length} service{billingDetailCustomer.services.length !== 1 ? 's' : ''}</span>
+                  <span>
+                    Rate: ${billingDetailCustomer.services.reduce((sum, s) => sum + s.weeklyRate, 0).toFixed(2)}
+                    {' + '}Chemicals: ${billingDetailCustomer.services.reduce((sum, s) => sum + (s.chemicalCost || 0), 0).toFixed(2)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setBillingDetailCustomer(null)}
+                  className="flex-1 py-3 border-2 border-gray-300 text-gray-700 rounded-lg font-medium hover:bg-gray-50"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={() => {
+                    downloadInvoice(billingDetailCustomer.customer, invoiceMonth);
+                    setBillingDetailCustomer(null);
+                  }}
+                  disabled={billingDetailCustomer.services.length === 0}
+                  className="flex-1 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:bg-gray-300"
+                >
+                  Download PDF
                 </button>
               </div>
             </div>
