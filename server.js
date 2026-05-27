@@ -194,9 +194,10 @@ const textToHtml = (text) => {
 
 // Build a styled payment button for emails
 const buildPaymentButton = (url) => {
+  // Softer copy + simpler styling — avoids phishing-trigger words ("Pay Now",
+  // "Securely"), emojis in CTAs, and the heavy gradient that some filters flag.
   return `<div style="text-align:center;margin:28px 0;">
-<a href="${url}" target="_blank" style="display:inline-block;background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#ffffff;font-size:17px;font-weight:bold;padding:16px 48px;border-radius:8px;text-decoration:none;letter-spacing:0.5px;box-shadow:0 4px 14px rgba(37,99,235,0.4);border:none;cursor:pointer;">&#128274; Pay Now Securely</a>
-<p style="margin:10px 0 0;font-size:12px;color:#6b7280;">Secure payment powered by <strong>Stripe</strong> &mdash; all major cards accepted</p>
+<a href="${url}" target="_blank" style="display:inline-block;background:#2563eb;color:#ffffff;font-size:16px;font-weight:600;padding:14px 36px;border-radius:6px;text-decoration:none;">View invoice and pay</a>
 </div>`;
 };
 
@@ -238,6 +239,44 @@ const buildEmailHtml = (bodyContent, companySettings) => {
 };
 
 // Send email via Resend HTTP API
+// Generate a plain-text version of an HTML email body.
+// Gmail/Outlook strongly prefer multipart (text + html) over HTML-only;
+// HTML-only is one of the biggest deliverability red flags.
+const htmlToText = (html) => {
+  if (!html) return '';
+  return String(html)
+    // Drop entire <head>, <style>, <script> blocks
+    .replace(/<head[\s\S]*?<\/head>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    // Block-level tags → line breaks
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, '\n')
+    // Links → "text (url)"
+    .replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, '$2 ($1)')
+    // Images with alt text → [alt]
+    .replace(/<img[^>]*alt="([^"]*)"[^>]*\/?>/gi, '[$1]')
+    .replace(/<img[^>]*\/?>/gi, '')
+    // Strip everything else
+    .replace(/<[^>]+>/g, '')
+    // Decode common HTML entities
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&hellip;/g, '…')
+    .replace(/&#x?[0-9a-f]+;/gi, '')
+    // Cleanup whitespace
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ ?\n ?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+};
+
 const sendEmail = async (to, subject, htmlBody, fromName, attachments) => {
   if (!RESEND_API_KEY) {
     throw new Error('Email not configured. Set RESEND_API_KEY environment variable on Render.');
@@ -245,7 +284,14 @@ const sendEmail = async (to, subject, htmlBody, fromName, attachments) => {
   const emailMatch = EMAIL_FROM.match(/<([^>]+)>/);
   const fromAddress = emailMatch ? emailMatch[1] : EMAIL_FROM;
   const from = fromName ? `${fromName} <${fromAddress}>` : EMAIL_FROM;
-  const payload = { from, to: [to], subject, html: htmlBody, reply_to: EMAIL_REPLY_TO };
+  const payload = {
+    from,
+    to: [to],
+    subject,
+    html: htmlBody,
+    text: htmlToText(htmlBody),  // plain-text alternative → big deliverability win
+    reply_to: EMAIL_REPLY_TO,
+  };
   if (attachments && attachments.length > 0) {
     payload.attachments = attachments;
   }
@@ -1372,7 +1418,7 @@ app.post('/send-invoice', rateLimit(10, 60000), authenticateUser, async (req, re
 
     // If template didn't include {{payment_link}} placeholder, append it as fallback
     if (paymentLink && !template.body?.includes('{{payment_link}}')) {
-      body += `\n\n[Click here to pay securely](${paymentLink})`;
+      body += `\n\n[View invoice and pay](${paymentLink})`;
     }
 
     let htmlBody = textToHtml(body);
@@ -1415,7 +1461,7 @@ app.post('/send-weekly-update', rateLimit(10, 60000), authenticateUser, async (r
 
     // If template didn't include {{payment_link}} placeholder, append it as fallback
     if (paymentLink && !template.body?.includes('{{payment_link}}')) {
-      body += `\n\n[Click here to pay securely](${paymentLink})`;
+      body += `\n\n[View invoice and pay](${paymentLink})`;
     }
 
     let bodyHtml = textToHtml(body);
