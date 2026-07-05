@@ -868,11 +868,13 @@ app.post('/api/tech-assist', rateLimit(20, 60000), optionalAuth, techAssistUploa
     if (conversation_history) {
       try {
         const history = JSON.parse(conversation_history);
-        // Sanitize: only allow user/assistant roles with string content (prevent prompt injection)
+        // Sanitize: only allow user/assistant roles with string content (prevent prompt injection).
+        // Cap to the last 12 turns and clamp each message so a caller can't stuff ~250K tokens of
+        // history into one request and run up the Anthropic/OpenAI bill.
         if (Array.isArray(history)) {
-          for (const msg of history) {
+          for (const msg of history.slice(-12)) {
             if (msg && ['user', 'assistant'].includes(msg.role) && typeof msg.content === 'string') {
-              messages.push({ role: msg.role, content: msg.content });
+              messages.push({ role: msg.role, content: msg.content.slice(0, 4000) });
             }
           }
         }
@@ -1546,8 +1548,10 @@ app.post('/api/create-checkout-session', authenticateUser, async (req, res) => {
 
     // Validate required fields
     const parsedAmount = typeof amount === 'number' ? amount : parseFloat(amount);
-    if (!parsedAmount || parsedAmount <= 0 || parsedAmount > 999999 || isNaN(parsedAmount)) {
-      return res.status(400).json({ error: 'Valid amount is required (between $0.01 and $999,999)' });
+    // Floor at $0.50 (Stripe's minimum charge) — anything less rounds toward a $0 price or
+    // fails at checkout, so the app would think a link was sent when the customer can't pay.
+    if (!parsedAmount || parsedAmount < 0.50 || parsedAmount > 999999 || isNaN(parsedAmount)) {
+      return res.status(400).json({ error: 'Valid amount is required (between $0.50 and $999,999)' });
     }
 
     // Use Stripe Payment Links (never expire) instead of Checkout Sessions (24h max)
@@ -2048,10 +2052,10 @@ app.get('/payment-success', async (req, res) => {
 <div class="card">
   <div class="check"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg></div>
   <h1>Payment Successful!</h1>
-  <p class="subtitle">Thank you${customerName !== 'Valued Customer' ? ', ' + customerName.split(' ')[0] : ''}! Your payment has been received.</p>
+  <p class="subtitle">Thank you${customerName !== 'Valued Customer' ? ', ' + escapeHtml(customerName.split(' ')[0]) : ''}! Your payment has been received.</p>
   ${amount ? `<div class="details">
     <div class="row"><span class="label">Amount Paid</span><span class="value amount">$${amount}</span></div>
-    ${invoiceRef ? `<div class="row"><span class="label">Reference</span><span class="value">${invoiceRef}</span></div>` : ''}
+    ${invoiceRef ? `<div class="row"><span class="label">Reference</span><span class="value">${escapeHtml(invoiceRef)}</span></div>` : ''}
     <div class="row"><span class="label">Date</span><span class="value">${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</span></div>
   </div>` : ''}
   <p class="note">A receipt has been sent to your email. You may close this page.</p>
@@ -2104,7 +2108,7 @@ const signedContractUpload = multer({
   },
 });
 
-app.post('/api/send-signed-contract', rateLimit(10, 60000), signedContractUpload.single('pdf'), async (req, res) => {
+app.post('/api/send-signed-contract', rateLimit(10, 60000), authenticateUser, signedContractUpload.single('pdf'), async (req, res) => {
   try {
     const { customerEmail, companyEmail, contractNumber, customerName, companyName } = req.body;
     if (!req.file) {
@@ -2131,11 +2135,11 @@ app.post('/api/send-signed-contract', rateLimit(10, 60000), signedContractUpload
           `Your Signed Contract #${contractNumber}`,
           `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto;">
             <div style="background: linear-gradient(135deg, #1B3A5C 0%, #2d5a8e 100%); padding: 32px; text-align: center;">
-              <h1 style="color: white; margin: 0; font-size: 24px;">${fromName}</h1>
+              <h1 style="color: white; margin: 0; font-size: 24px;">${escapeHtml(fromName)}</h1>
             </div>
             <div style="padding: 32px; background: white;">
-              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Hi ${customerName || 'there'},</p>
-              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Thank you for signing your agreement. A copy of your signed contract (#${contractNumber}) is attached to this email for your records.</p>
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Hi ${escapeHtml(customerName || 'there')},</p>
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Thank you for signing your agreement. A copy of your signed contract (#${escapeHtml(contractNumber || '')}) is attached to this email for your records.</p>
               <p style="color: #6b7280; font-size: 14px;">If you have any questions, please don't hesitate to reach out.</p>
             </div>
           </div>`,
@@ -2156,10 +2160,10 @@ app.post('/api/send-signed-contract', rateLimit(10, 60000), signedContractUpload
           `Contract #${contractNumber} Signed by ${customerName || 'Customer'}`,
           `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto;">
             <div style="background: linear-gradient(135deg, #1B3A5C 0%, #2d5a8e 100%); padding: 32px; text-align: center;">
-              <h1 style="color: white; margin: 0; font-size: 24px;">${fromName}</h1>
+              <h1 style="color: white; margin: 0; font-size: 24px;">${escapeHtml(fromName)}</h1>
             </div>
             <div style="padding: 32px; background: white;">
-              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Contract #${contractNumber} has been signed by <strong>${customerName || 'the customer'}</strong>.</p>
+              <p style="color: #374151; font-size: 16px; line-height: 1.6;">Contract #${escapeHtml(contractNumber || '')} has been signed by <strong>${escapeHtml(customerName || 'the customer')}</strong>.</p>
               <p style="color: #374151; font-size: 16px; line-height: 1.6;">The signed PDF is attached to this email.</p>
             </div>
           </div>`,
