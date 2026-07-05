@@ -15,6 +15,9 @@ const XLSX = require('xlsx');
 const JSZip = require('jszip');
 
 const app = express();
+// Behind Render's proxy: trust it so req.ip is the real client (per-IP rate limits
+// actually work) and req.protocol is https (generated links aren't http://).
+app.set('trust proxy', 1);
 
 // Your Stripe Secret Key (use environment variable in production!)
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
@@ -1701,7 +1704,7 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
           success: true,
           status: session.payment_status,
           amountTotal: session.amount_total / 100,
-          customerEmail: session.customer_email,
+          customerEmail: session.customer_details?.email || session.customer_email,
           metadata: session.metadata
         });
       }
@@ -1716,7 +1719,7 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
       success: true,
       status: session.payment_status,
       amountTotal: session.amount_total / 100,
-      customerEmail: session.customer_email,
+      customerEmail: session.customer_details?.email || session.customer_email,
       metadata: session.metadata
     });
 
@@ -1739,13 +1742,11 @@ async function handleStripeWebhook(req, res) {
   try {
     if (webhookSecret) {
       event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-    } else if (process.env.NODE_ENV === 'production') {
-      // Require webhook secret in production — prevent forged events
-      console.error('STRIPE_WEBHOOK_SECRET not set in production — rejecting webhook');
-      return res.status(500).json({ error: 'Webhook secret not configured' });
     } else {
-      // Allow unverified webhooks only in development
-      event = JSON.parse(req.body);
+      // No secret configured → refuse. NEVER parse an unverified body: a forged
+      // checkout.session.completed could mark any invoice paid and deactivate links.
+      console.error('STRIPE_WEBHOOK_SECRET not set — rejecting unverified webhook');
+      return res.status(500).json({ error: 'Webhook secret not configured' });
     }
   } catch (err) {
     console.error('Webhook signature verification failed:', err.message);
@@ -1819,14 +1820,17 @@ async function handleStripeWebhook(req, res) {
 
           if (orgId && customerId && billingMonth) {
             const invoiceKey = `${customerId}-${billingMonth}`;
+            // Write to the paid_invoices COLUMN — the ledger the frontend actually reads.
+            // (Previously wrote org.settings.paidInvoices, which the app never reads, so a
+            // Stripe payment's paid flag never reached the billing UI — the drift we chased.)
             const { data: org } = await supabase
               .from('organizations')
-              .select('settings')
+              .select('paid_invoices')
               .eq('id', orgId)
               .single();
 
             if (org) {
-              const existingPaidInvoices = org.settings?.paidInvoices || {};
+              const existingPaidInvoices = org.paid_invoices || {};
               existingPaidInvoices[invoiceKey] = {
                 paid: true,
                 method: 'electronic',
@@ -1836,7 +1840,7 @@ async function handleStripeWebhook(req, res) {
               };
               await supabase
                 .from('organizations')
-                .update({ settings: { ...org.settings, paidInvoices: existingPaidInvoices } })
+                .update({ paid_invoices: existingPaidInvoices })
                 .eq('id', orgId);
             }
           }
@@ -1847,8 +1851,11 @@ async function handleStripeWebhook(req, res) {
         }
       }
 
-      // Send payment receipt email
-      if (session.customer_email) {
+      // Send payment receipt email. For payment-link checkouts the address the customer
+      // typed lives in customer_details.email; customer_email is only a prefill (null here),
+      // so receipts silently never sent before.
+      const receiptEmail = session.customer_details?.email || session.customer_email;
+      if (receiptEmail) {
         try {
           const amount = (session.amount_total / 100).toFixed(2);
           const customerName = session.metadata?.customerName || 'Valued Customer';
@@ -1881,12 +1888,12 @@ async function handleStripeWebhook(req, res) {
           `, { companyName });
 
           await sendEmail(
-            session.customer_email,
+            receiptEmail,
             `Payment Receipt — $${amount} — ${companyName}`,
             receiptHtml,
             companyName
           );
-          console.log(`Payment receipt email sent to ${session.customer_email}`);
+          console.log(`Payment receipt email sent to ${receiptEmail}`);
         } catch (emailErr) {
           console.error('Failed to send payment receipt email:', emailErr.message);
           // Don't fail the webhook response for email errors
@@ -1919,6 +1926,13 @@ async function handleStripeWebhook(req, res) {
 // Short payment link redirect
 app.get('/pay/:code', async (req, res) => {
   const { code } = req.params;
+
+  // Codes are exactly 8 alphanumerics (generateShortCode). Reject anything else BEFORE any
+  // lookup — otherwise a code like "%" turns the LIKE query into "%/pay/%" and redirects to
+  // some other customer's live payment link.
+  if (!/^[A-Za-z0-9]{8}$/.test(code)) {
+    return res.status(404).send('Invalid or expired payment link.');
+  }
 
   // Check in-memory cache first
   const cached = shortLinks.get(code);
