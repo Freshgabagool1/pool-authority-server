@@ -1643,6 +1643,62 @@ app.post('/api/create-checkout-session', authenticateUser, async (req, res) => {
   }
 });
 
+// Create an employee. profiles.id has a FK to auth.users, and recurring_services.assigned_tech
+// / service_history.tech_id FK to profiles — so an employee MUST be a real auth user. The
+// client can't create auth users; the service role does it here. The account is login-dormant
+// (random password) — the crew identifies via the in-app "Who's working?" picker, not a login.
+app.post('/api/create-employee', authenticateUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Database not configured' });
+    const { name, email, phone, color } = req.body || {};
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Employee name is required' });
+
+    // Scope to the caller's org (never trust an org id from the body).
+    const { data: caller, error: callerErr } = await supabase
+      .from('profiles').select('org_id, role').eq('id', req.user.id).single();
+    if (callerErr || !caller?.org_id) return res.status(403).json({ error: 'Could not resolve your organization' });
+
+    // Auth needs a unique identifier; use the provided email or a non-deliverable placeholder.
+    const providedEmail = (email && String(email).trim()) ? String(email).trim() : '';
+    const authEmail = providedEmail || `tech-${crypto.randomBytes(5).toString('hex')}@no-login.poolauthority.local`;
+
+    const { data: created, error: authErr } = await supabase.auth.admin.createUser({
+      email: authEmail,
+      password: crypto.randomBytes(18).toString('hex'),
+      email_confirm: true,
+      user_metadata: { full_name: String(name).trim(), role: 'tech' },
+    });
+    if (authErr) return res.status(400).json({ error: `Auth: ${authErr.message}` });
+    const userId = created.user.id;
+
+    const { data: profile, error: profErr } = await supabase.from('profiles').insert({
+      id: userId,
+      org_id: caller.org_id,
+      email: providedEmail,           // keep the UI email clean (blank if none given)
+      full_name: String(name).trim(),
+      phone: phone || '',
+      role: 'tech',
+      color: color || '#3B82F6',
+      is_active: true,
+    }).select().single();
+    if (profErr) {
+      // Roll back the orphan auth user so a retry doesn't collide.
+      await supabase.auth.admin.deleteUser(userId).catch(() => {});
+      return res.status(400).json({ error: `Profile: ${profErr.message}` });
+    }
+
+    return res.json({
+      success: true,
+      employee: {
+        id: profile.id, name: profile.full_name, email: profile.email,
+        phone: profile.phone, color: profile.color, role: profile.role, isActive: profile.is_active,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // Create a Payment Link (reusable)
 app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
   try {
