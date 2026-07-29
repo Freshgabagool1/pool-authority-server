@@ -1984,6 +1984,174 @@ async function handleStripeWebhook(req, res) {
 }
 
 // Short payment link redirect
+// ============================================================
+// VAN TRACKING — live "on my way" customer portal
+// Position docs live in a private storage bucket, touched only by this
+// server (service role) — no table migration, no RLS to configure.
+// The 24-hex token in the link is the only secret; links expire in 12h.
+// ============================================================
+const TRACK_BUCKET = 'van-tracking';
+const TRACK_TOKEN_RE = /^[a-f0-9]{24}$/;
+let trackBucketReady = false;
+
+async function ensureTrackBucket() {
+  if (trackBucketReady || !supabase) return;
+  try { await supabase.storage.createBucket(TRACK_BUCKET, { public: false }); } catch (e) { /* already exists */ }
+  trackBucketReady = true;
+}
+
+async function readTrack(token) {
+  await ensureTrackBucket();
+  const { data, error } = await supabase.storage.from(TRACK_BUCKET).download(`${token}.json`);
+  if (error || !data) return null;
+  try { return JSON.parse(await data.text()); } catch { return null; }
+}
+
+async function writeTrack(token, doc) {
+  await ensureTrackBucket();
+  await supabase.storage.from(TRACK_BUCKET).upload(`${token}.json`, Buffer.from(JSON.stringify(doc)), { upsert: true, contentType: 'application/json' });
+}
+
+// Start a tracking session (tech app, authed). Returns the shareable link.
+app.post('/api/track/start', rateLimit(30, 60000), authenticateUser, async (req, res) => {
+  try {
+    if (!supabase) return res.status(500).json({ error: 'Storage unavailable' });
+    const { destLat, destLng, firstName, techName, company, etaMin } = req.body || {};
+    if (typeof destLat !== 'number' || typeof destLng !== 'number') {
+      return res.status(400).json({ error: 'destLat/destLng required' });
+    }
+    const token = require('crypto').randomBytes(12).toString('hex');
+    const now = new Date().toISOString();
+    await writeTrack(token, {
+      dest: { lat: destLat, lng: destLng },
+      firstName: String(firstName || '').slice(0, 40),
+      techName: String(techName || '').slice(0, 60),
+      company: String(company || 'Pool Authority').slice(0, 80),
+      status: 'enroute',
+      etaMin: typeof etaMin === 'number' ? etaMin : null,
+      van: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    // Lazy cleanup of stale docs (>2 days), best effort
+    supabase.storage.from(TRACK_BUCKET).list('', { limit: 100 }).then(({ data }) => {
+      const cutoff = Date.now() - 2 * 24 * 3600 * 1000;
+      const old = (data || []).filter(f => f.created_at && new Date(f.created_at).getTime() < cutoff).map(f => f.name);
+      if (old.length) supabase.storage.from(TRACK_BUCKET).remove(old).catch(() => {});
+    }).catch(() => {});
+    res.json({ token, url: `${req.protocol}://${req.get('host')}/track/${token}` });
+  } catch (e) {
+    console.error('track/start:', e.message);
+    res.status(500).json({ error: 'Could not start tracking' });
+  }
+});
+
+// Position update from the tech's phone (authed; every ~15s while en route)
+app.post('/api/track/update', rateLimit(120, 60000), authenticateUser, async (req, res) => {
+  try {
+    const { token, lat, lng, etaMin, status } = req.body || {};
+    if (!TRACK_TOKEN_RE.test(String(token || ''))) return res.status(400).json({ error: 'Bad token' });
+    const doc = await readTrack(token);
+    if (!doc) return res.status(404).json({ error: 'Unknown token' });
+    if (typeof lat === 'number' && typeof lng === 'number') doc.van = { lat, lng };
+    if (typeof etaMin === 'number') doc.etaMin = etaMin;
+    if (status && ['enroute', 'arrived', 'ended'].includes(status)) doc.status = status;
+    doc.updatedAt = new Date().toISOString();
+    await writeTrack(token, doc);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+// Public JSON the portal polls (token in the URL is the auth)
+app.get('/api/track/:token', rateLimit(240, 60000), async (req, res) => {
+  const { token } = req.params;
+  if (!TRACK_TOKEN_RE.test(token)) return res.status(404).json({ error: 'Not found' });
+  const doc = await readTrack(token).catch(() => null);
+  if (!doc) return res.status(404).json({ error: 'Not found' });
+  if (Date.now() - new Date(doc.createdAt).getTime() > 12 * 3600 * 1000) {
+    return res.json({ status: 'ended', expired: true });
+  }
+  res.json(doc);
+});
+
+// Public tracking page — Google Map when a key is configured, clean text tracker otherwise
+app.get('/track/:token', (req, res) => {
+  const { token } = req.params;
+  if (!TRACK_TOKEN_RE.test(token)) return res.status(404).send('Invalid tracking link.');
+  const mapsKey = process.env.GOOGLE_MAPS_KEY || '';
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Technician on the way</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background: #f1f5f9; color: #1e293b; }
+  .head { background: linear-gradient(135deg, #1e3a5f, #2d5a87); color: #fff; padding: 18px 20px; }
+  .head h1 { font-size: 18px; }
+  .head .co { font-size: 12px; opacity: .8; margin-top: 2px; }
+  .card { background: #fff; margin: 14px; border-radius: 14px; padding: 18px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+  .eta { font-size: 44px; font-weight: 800; color: #059669; line-height: 1; }
+  .eta small { font-size: 15px; font-weight: 600; color: #64748b; }
+  .sub { color: #64748b; font-size: 13px; margin-top: 6px; }
+  #map { height: 46vh; margin: 0 14px 14px; border-radius: 14px; background: #e2e8f0; display: none; }
+  .foot { text-align: center; color: #94a3b8; font-size: 11px; padding: 10px 0 20px; }
+  .arrived { color: #2563eb; font-size: 30px; font-weight: 800; }
+  .pulse { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #10b981; margin-right: 6px; animation: p 1.4s infinite; }
+  @keyframes p { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+</style>
+</head><body>
+<div class="head"><h1 id="title">🚐 Your technician is on the way</h1><div class="co" id="co"></div></div>
+<div class="card">
+  <div id="status"><span class="pulse"></span><span id="statustext">Connecting…</span></div>
+  <div style="margin-top:10px;"><span class="eta" id="eta">–</span> <small id="etaunit"></small></div>
+  <div class="sub" id="dist"></div>
+</div>
+<div id="map"></div>
+<div class="foot" id="foot"></div>
+<script>
+var TOKEN='${token}', MAPS_KEY='${mapsKey}';
+var map=null, vanMarker=null, destMarker=null, fitted=false;
+function hav(a,b,c,d){var R=3958.8,p=Math.PI/180,x=(c-a)*p/2,y=(d-b)*p/2,h=Math.sin(x)*Math.sin(x)+Math.cos(a*p)*Math.cos(c*p)*Math.sin(y)*Math.sin(y);return 2*R*Math.asin(Math.sqrt(h));}
+function initMapIfReady(doc){
+  if(!MAPS_KEY||map||!window.google||!google.maps||!doc.dest)return;
+  document.getElementById('map').style.display='block';
+  map=new google.maps.Map(document.getElementById('map'),{center:{lat:doc.dest.lat,lng:doc.dest.lng},zoom:12,disableDefaultUI:true,zoomControl:true});
+  destMarker=new google.maps.Marker({position:{lat:doc.dest.lat,lng:doc.dest.lng},map:map,label:'🏠'});
+}
+function render(doc){
+  var st=document.getElementById('statustext'),eta=document.getElementById('eta'),unit=document.getElementById('etaunit'),dist=document.getElementById('dist');
+  document.getElementById('co').textContent=doc.company||'';
+  document.getElementById('foot').textContent='Live tracking by '+(doc.company||'Pool Authority');
+  if(doc.expired||doc.status==='ended'){st.textContent='This tracking link has ended.';eta.textContent='–';unit.textContent='';dist.textContent='';return;}
+  if(doc.status==='arrived'){document.getElementById('title').textContent='🎉 We\\u2019ve arrived!';st.textContent='Your technician '+(doc.techName||'')+' is here.';eta.innerHTML='<span class=\"arrived\">Here now</span>';unit.textContent='';dist.textContent='';}
+  else{
+    st.textContent=(doc.techName?doc.techName+' is':'We are')+' heading your way'+(doc.firstName?', '+doc.firstName:'')+'.';
+    if(doc.etaMin!=null){eta.textContent='~'+doc.etaMin;unit.textContent='minutes away';}
+    else{eta.textContent='On the way';unit.textContent='';}
+    if(doc.van&&doc.dest){var m=hav(doc.van.lat,doc.van.lng,doc.dest.lat,doc.dest.lng);dist.textContent=m<0.25?'Almost there!':m.toFixed(1)+' miles away';}
+  }
+  initMapIfReady(doc);
+  if(map&&doc.van){
+    var vp={lat:doc.van.lat,lng:doc.van.lng};
+    if(!vanMarker)vanMarker=new google.maps.Marker({position:vp,map:map,label:'🚐'});
+    else vanMarker.setPosition(vp);
+    if(!fitted&&doc.dest){var b=new google.maps.LatLngBounds();b.extend(vp);b.extend({lat:doc.dest.lat,lng:doc.dest.lng});map.fitBounds(b,60);fitted=true;}
+  }
+}
+function poll(){
+  fetch('/api/track/'+TOKEN).then(function(r){if(!r.ok)throw 0;return r.json();}).then(render)
+  .catch(function(){document.getElementById('statustext').textContent='Tracking unavailable.';});
+}
+window.gm_authFailure=function(){document.getElementById('map').style.display='none';};
+if(MAPS_KEY){var s=document.createElement('script');s.src='https://maps.googleapis.com/maps/api/js?key='+MAPS_KEY;s.async=true;s.onload=poll;s.onerror=poll;document.head.appendChild(s);}
+poll();setInterval(poll,12000);
+</script>
+</body></html>`);
+});
+
 app.get('/pay/:code', async (req, res) => {
   const { code } = req.params;
 
