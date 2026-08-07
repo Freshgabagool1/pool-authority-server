@@ -1702,10 +1702,17 @@ app.post('/api/create-employee', authenticateUser, async (req, res) => {
 // Create a Payment Link (reusable)
 app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
   try {
-    const { amount, description, invoiceNumber } = req.body;
+    const { amount, description, invoiceNumber, customerId, billingMonth, invoiceId, customerName, deactivateLinkId } = req.body;
 
     if (!amount || typeof amount !== 'number' || !isFinite(amount) || amount <= 0 || amount > 999999.99) {
       return res.status(400).json({ error: 'Valid amount is required (must be between $0.01 and $999,999.99)' });
+    }
+
+    // Invoice emails now use Payment Links (Checkout Sessions expire after 24h — customers
+    // opening an email a day later hit a dead link). When a fresh link replaces an old one
+    // (resend after an adjustment), deactivate the old so a stale total can't be paid.
+    if (deactivateLinkId && /^plink_[A-Za-z0-9]+$/.test(deactivateLinkId)) {
+      try { await stripe.paymentLinks.update(deactivateLinkId, { active: false }); } catch (e) { /* already inactive */ }
     }
 
     // First create a price
@@ -1717,7 +1724,8 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
       },
     });
 
-    // Then create the payment link
+    // Then create the payment link. Metadata is copied onto the Checkout Sessions the
+    // link spawns, so the app's payment poller can write its ledger keys.
     const paymentLink = await stripe.paymentLinks.create({
       line_items: [
         {
@@ -1726,8 +1734,16 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
         },
       ],
       metadata: {
-        invoiceNumber,
-        description
+        invoiceNumber: invoiceNumber || '',
+        description: description || '',
+        customerId: customerId || '',
+        billingMonth: billingMonth || '',
+        invoiceId: invoiceId || '',
+        customerName: customerName || '',
+      },
+      after_completion: {
+        type: 'redirect',
+        redirect: { url: `${req.protocol}://${req.get('host')}/payment-success?session_id={CHECKOUT_SESSION_ID}` },
       },
     });
 
