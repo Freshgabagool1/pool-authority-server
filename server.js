@@ -1812,6 +1812,48 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
   }
 });
 
+// Resolve a buy.stripe.com URL back to its Payment Link id and paid status.
+// Some invoices store only the link URL: pre-v5.10.10 builds stamped a re-minted
+// (statement/resend) link's URL into stripe_payment_link but the id column kept
+// the old per-invoice id, so status can only be checked starting from the URL.
+app.get('/api/payment-link-by-url', optionalAuth, async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url || !/^https:\/\/buy\.stripe\.com\/[A-Za-z0-9_]+$/.test(url)) {
+      return res.status(400).json({ error: 'Invalid payment link URL' });
+    }
+    // Stripe has no lookup-by-URL — page through recent links (newest first),
+    // capped so a miss can't turn into an unbounded scan of the whole account.
+    let match = null;
+    let scanned = 0;
+    for await (const link of stripe.paymentLinks.list({ limit: 100 })) {
+      if (link.url === url) { match = link; break; }
+      if (++scanned >= 500) break;
+    }
+    if (!match) return res.json({ success: true, found: false });
+    const sessions = await stripe.checkout.sessions.list({
+      payment_link: match.id,
+      limit: 20,
+    });
+    const paid = sessions.data.find(s => s.payment_status === 'paid');
+    const session = paid || sessions.data[0];
+    return res.json({
+      success: true,
+      found: true,
+      paymentLinkId: match.id,
+      active: match.active,
+      status: session ? session.payment_status : 'unpaid',
+      amountTotal: session ? session.amount_total / 100 : null,
+      customerEmail: session ? (session.customer_details?.email || session.customer_email) : null,
+      metadata: session ? session.metadata : null,
+      paidAt: paid ? paid.created : null
+    });
+  } catch (error) {
+    console.error('Error resolving payment link by URL:', error);
+    res.status(500).json({ error: 'Failed to resolve payment link', message: error.message });
+  }
+});
+
 // Webhook handler (route registered above express.json() middleware for raw body access)
 async function handleStripeWebhook(req, res) {
   const sig = req.headers['stripe-signature'];
