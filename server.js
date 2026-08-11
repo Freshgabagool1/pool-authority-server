@@ -1768,14 +1768,18 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
   try {
     const { sessionId } = req.params;
 
-    // Payment Link IDs start with "plink_" — look up completed checkout sessions for this link
+    // Payment Link IDs start with "plink_" — look up completed checkout sessions for this link.
+    // Check ALL recent sessions for a PAID one: every open of the link creates a fresh
+    // unpaid session, so limit:1 (newest) hid the paid session behind any later click —
+    // which is exactly how combined-statement payments went undetected.
     if (sessionId.startsWith('plink_')) {
       const sessions = await stripe.checkout.sessions.list({
         payment_link: sessionId,
-        limit: 1,
+        limit: 20,
       });
-      if (sessions.data.length > 0) {
-        const session = sessions.data[0];
+      const paid = sessions.data.find(s => s.payment_status === 'paid');
+      const session = paid || sessions.data[0];
+      if (session) {
         return res.json({
           success: true,
           status: session.payment_status,
