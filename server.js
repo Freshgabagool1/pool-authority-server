@@ -1935,6 +1935,55 @@ async function handleStripeWebhook(req, res) {
 
           if (invoiceUpdateError) console.error('Failed to mark invoice paid:', invoiceUpdateError.message);
 
+          // Combined statements: the app mints ONE payment link for several invoices and
+          // stamps its id on each of them, with a synthetic STMT-xxxxxxxx number that no
+          // invoice row carries — so the lookup above matches nothing and, until now, a
+          // statement paid while the app was closed stayed "sent" until someone opened the
+          // Payments tab. Resolve the link to its invoices and settle each for ITS OWN
+          // total (never the statement total on every row).
+          if ((!updatedInvoices || updatedInvoices.length === 0) && session.payment_link) {
+            const { data: linked, error: linkedErr } = await supabase
+              .from('invoices')
+              .select('id, org_id, customer_id, total, status, metadata')
+              .eq('stripe_invoice_id', session.payment_link)
+              .neq('status', 'paid')
+              .neq('status', 'void');
+            if (linkedErr) console.error('Statement lookup failed:', linkedErr.message);
+            if (linked && linked.length > 0) {
+              const invoiced = linked.reduce((s, i) => s + (parseFloat(i.total) || 0), 0);
+              if (Math.abs(invoiced - amountPaid) > 0.01) {
+                console.warn(`Statement ${session.metadata.invoiceNumber}: received $${amountPaid.toFixed(2)} vs $${invoiced.toFixed(2)} across ${linked.length} invoices — allocating by invoice total`);
+              }
+              const ledgerEntries = {};
+              for (const inv of linked) {
+                const own = parseFloat(inv.total) || 0;
+                const { error: e1 } = await supabase
+                  .from('invoices')
+                  .update({ status: 'paid', payment_date: paidAt, payment_method: 'stripe', amount_paid: own, stripe_payment_intent: session.payment_intent || '' })
+                  .eq('id', inv.id);
+                if (e1) { console.error(`Failed to mark statement invoice ${inv.id} paid:`, e1.message); continue; }
+                const entry = { paid: true, method: 'electronic', source: 'Stripe', paidDate: paidAt, amount: own };
+                const meta = inv.metadata || {};
+                ledgerEntries[inv.id] = entry;
+                if (meta.billingMonth && inv.customer_id) ledgerEntries[`${inv.customer_id}-${meta.billingMonth}`] = entry;
+                if (meta.jobId) ledgerEntries[`job-${meta.jobId}`] = entry;
+                if (meta.quoteId) ledgerEntries[`quote-inv-${meta.quoteId}`] = entry;
+                (Array.isArray(meta.serviceIds) ? meta.serviceIds : []).forEach(sid => { ledgerEntries[`job-${sid}`] = entry; });
+              }
+              const stmtOrgId = linked[0].org_id;
+              if (stmtOrgId && Object.keys(ledgerEntries).length > 0) {
+                const { data: org } = await supabase.from('organizations').select('paid_invoices').eq('id', stmtOrgId).single();
+                if (org) {
+                  const merged = { ...(org.paid_invoices || {}) };
+                  Object.entries(ledgerEntries).forEach(([k, v]) => { if (!merged[k]?.paid) merged[k] = v; });
+                  await supabase.from('organizations').update({ paid_invoices: merged }).eq('id', stmtOrgId);
+                }
+              }
+              console.log(`Statement ${session.metadata.invoiceNumber}: ${linked.length} invoice(s) marked paid via payment link ${session.payment_link}`);
+              // No early exit: the receipt email below must still go out.
+            }
+          }
+
           // Update org paid_invoices for billing tab (keyed by customerId-YYYY-MM)
           const orgId = updatedInvoices?.[0]?.org_id;
           const customerId = session.metadata.customerId || updatedInvoices?.[0]?.customer_id;
