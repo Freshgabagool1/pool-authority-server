@@ -13,6 +13,7 @@ const OpenAI = require('openai').default || require('openai');
 const mammoth = require('mammoth');
 const XLSX = require('xlsx');
 const JSZip = require('jszip');
+const { settleCheckoutSession, markReceiptSent } = require('./lib/settlePayment');
 
 const app = express();
 // Behind Render's proxy: trust it so req.ip is the real client (per-IP rate limits
@@ -1763,6 +1764,51 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
   }
 });
 
+// Settle whatever has been PAID on a payment link or checkout session, using the same
+// tested logic as the webhook (lib/settlePayment.js — idempotent, keyed on the
+// payment). The app's poller calls this instead of allocating money itself, so there
+// is exactly one implementation of "what does a payment do to the books", and a
+// stale device can never apply a payment against an old copy of an invoice.
+app.post('/api/settle-payment', authenticateUser, async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    if (!sessionId || typeof sessionId !== 'string' || !/^(plink_|cs_)[A-Za-z0-9_]+$/.test(sessionId)) {
+      return res.status(400).json({ error: 'sessionId (plink_… or cs_…) is required' });
+    }
+    if (!supabase) return res.status(503).json({ error: 'Database not configured' });
+    if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
+    let sessions = [];
+    if (sessionId.startsWith('plink_')) {
+      const list = await stripe.checkout.sessions.list({ payment_link: sessionId, limit: 20 });
+      sessions = list.data.filter(s => s.payment_status === 'paid'); // every paid checkout, oldest last
+    } else {
+      const s = await stripe.checkout.sessions.retrieve(sessionId);
+      if (s && s.payment_status === 'paid') sessions = [s];
+    }
+    const results = [];
+    for (const session of sessions.slice().reverse()) {
+      const r = await settleCheckoutSession({ supabase, session });
+      const d = r.detail || {};
+      results.push({
+        sessionId: session.id,
+        paymentIntent: typeof session.payment_intent === 'string' ? session.payment_intent : (session.payment_intent?.id || null),
+        amountTotal: session.amount_total / 100,
+        mode: r.mode, handled: r.handled, failed: r.failed, duplicate: r.duplicate,
+        settled: r.mode === 'statement' ? d.settled : (d.settled ? 1 : 0),
+        partial: r.mode === 'statement' ? d.partial : (d.partial ? 1 : 0),
+        flagged: Boolean(d.flagged),
+        shortfall: d.shortfall || 0,
+        overpayment: d.overpayment || 0,
+        invoiceIds: d.invoiceIds || [],
+      });
+    }
+    res.json({ success: true, paidSessions: sessions.length, results });
+  } catch (error) {
+    console.error('Error settling payment:', error);
+    res.status(500).json({ error: 'Failed to settle payment', message: error.message });
+  }
+});
+
 // Check payment status (supports both Checkout Session IDs and Payment Link IDs)
 app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
   try {
@@ -1785,7 +1831,11 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
           status: session.payment_status,
           amountTotal: session.amount_total / 100,
           customerEmail: session.customer_details?.email || session.customer_email,
-          metadata: session.metadata
+          metadata: session.metadata,
+          // Identity of the PAYMENT (a link can be paid more than once) — the app keys
+          // its idempotency on this, matching lib/paymentAllocation.js paymentIdOf().
+          sessionId: session.id,
+          paymentIntent: typeof session.payment_intent === 'string' ? session.payment_intent : (session.payment_intent?.id || null),
         });
       }
       // No sessions yet — payment link exists but hasn't been used
@@ -1800,7 +1850,9 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
       status: session.payment_status,
       amountTotal: session.amount_total / 100,
       customerEmail: session.customer_details?.email || session.customer_email,
-      metadata: session.metadata
+      metadata: session.metadata,
+      sessionId: session.id,
+      paymentIntent: typeof session.payment_intent === 'string' ? session.payment_intent : (session.payment_intent?.id || null),
     });
 
   } catch (error) {
@@ -1875,10 +1927,24 @@ async function handleStripeWebhook(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // Stripe treats any 2xx as "delivered". If a database write fails part-way we answer
+  // 5xx instead so the event is redelivered and the remaining work finishes; every
+  // write below is idempotent so a redelivery never applies money twice.
+  let dbFailed = false;
+  // Pure duplicate delivery (everything was already settled) — no second receipt.
+  let alreadySettled = false;
+
   // Handle the event
   switch (event.type) {
-    case 'checkout.session.completed': {
+    case 'checkout.session.completed':
+    case 'checkout.session.async_payment_succeeded': {
       const session = event.data.object;
+      // Delayed methods (bank debits etc.) fire session.completed before the money
+      // moves — settle only once Stripe reports the payment as paid.
+      if (session.payment_status && session.payment_status !== 'paid') {
+        console.log(`Checkout ${session.id} completed with payment_status=${session.payment_status} — waiting for async_payment_succeeded`);
+        break;
+      }
       console.log('Payment successful!', {
         sessionId: session.id,
         amount: session.amount_total / 100,
@@ -1902,131 +1968,36 @@ async function handleStripeWebhook(req, res) {
           .catch(e => console.error('Failed to deactivate payment link:', e.message));
       }
 
-      // Mark invoice as paid in Supabase
-      if (supabase && session.metadata?.invoiceNumber) {
+      // Record the payment: single invoice (by number) or combined statement (by link).
+      // All money rules + idempotency live in lib/settlePayment.js and are covered by
+      // the test suite (npm test). A failed write here must NOT be acknowledged to Stripe.
+      let settledInfo = null;
+      if (supabase) {
         try {
-          // Check if already processed (idempotency)
-          const { data: existingInvoice } = await supabase
-            .from('invoices')
-            .select('status')
-            .eq('invoice_number', session.metadata.invoiceNumber)
-            .single();
-
-          if (existingInvoice?.status === 'paid') {
-            console.log(`Invoice ${session.metadata.invoiceNumber} already paid — skipping`);
-            break;
-          }
-
-          const paidAt = new Date().toISOString();
-          const amountPaid = session.amount_total / 100;
-
-          // Update invoices table by invoice_number
-          const { data: updatedInvoices, error: invoiceUpdateError } = await supabase
-            .from('invoices')
-            .update({
-              status: 'paid',
-              payment_date: paidAt,
-              payment_method: 'stripe',
-              amount_paid: amountPaid,
-              stripe_payment_intent: session.payment_intent || '',
-            })
-            .eq('invoice_number', session.metadata.invoiceNumber)
-            .select('org_id, customer_id');
-
-          if (invoiceUpdateError) console.error('Failed to mark invoice paid:', invoiceUpdateError.message);
-
-          // Combined statements: the app mints ONE payment link for several invoices and
-          // stamps its id on each of them, with a synthetic STMT-xxxxxxxx number that no
-          // invoice row carries — so the lookup above matches nothing and, until now, a
-          // statement paid while the app was closed stayed "sent" until someone opened the
-          // Payments tab. Resolve the link to its invoices and settle each for ITS OWN
-          // total (never the statement total on every row).
-          if ((!updatedInvoices || updatedInvoices.length === 0) && session.payment_link) {
-            const { data: linked, error: linkedErr } = await supabase
-              .from('invoices')
-              .select('id, org_id, customer_id, total, status, metadata')
-              .eq('stripe_invoice_id', session.payment_link)
-              .neq('status', 'paid')
-              .neq('status', 'void');
-            if (linkedErr) console.error('Statement lookup failed:', linkedErr.message);
-            if (linked && linked.length > 0) {
-              const invoiced = linked.reduce((s, i) => s + (parseFloat(i.total) || 0), 0);
-              if (Math.abs(invoiced - amountPaid) > 0.01) {
-                console.warn(`Statement ${session.metadata.invoiceNumber}: received $${amountPaid.toFixed(2)} vs $${invoiced.toFixed(2)} across ${linked.length} invoices — allocating by invoice total`);
-              }
-              const ledgerEntries = {};
-              for (const inv of linked) {
-                const own = parseFloat(inv.total) || 0;
-                const { error: e1 } = await supabase
-                  .from('invoices')
-                  .update({ status: 'paid', payment_date: paidAt, payment_method: 'stripe', amount_paid: own, stripe_payment_intent: session.payment_intent || '' })
-                  .eq('id', inv.id);
-                if (e1) { console.error(`Failed to mark statement invoice ${inv.id} paid:`, e1.message); continue; }
-                const entry = { paid: true, method: 'electronic', source: 'Stripe', paidDate: paidAt, amount: own };
-                const meta = inv.metadata || {};
-                ledgerEntries[inv.id] = entry;
-                if (meta.billingMonth && inv.customer_id) ledgerEntries[`${inv.customer_id}-${meta.billingMonth}`] = entry;
-                if (meta.jobId) ledgerEntries[`job-${meta.jobId}`] = entry;
-                if (meta.quoteId) ledgerEntries[`quote-inv-${meta.quoteId}`] = entry;
-                (Array.isArray(meta.serviceIds) ? meta.serviceIds : []).forEach(sid => { ledgerEntries[`job-${sid}`] = entry; });
-              }
-              const stmtOrgId = linked[0].org_id;
-              if (stmtOrgId && Object.keys(ledgerEntries).length > 0) {
-                const { data: org } = await supabase.from('organizations').select('paid_invoices').eq('id', stmtOrgId).single();
-                if (org) {
-                  const merged = { ...(org.paid_invoices || {}) };
-                  Object.entries(ledgerEntries).forEach(([k, v]) => { if (!merged[k]?.paid) merged[k] = v; });
-                  await supabase.from('organizations').update({ paid_invoices: merged }).eq('id', stmtOrgId);
-                }
-              }
-              console.log(`Statement ${session.metadata.invoiceNumber}: ${linked.length} invoice(s) marked paid via payment link ${session.payment_link}`);
-              // No early exit: the receipt email below must still go out.
-            }
-          }
-
-          // Update org paid_invoices for billing tab (keyed by customerId-YYYY-MM)
-          const orgId = updatedInvoices?.[0]?.org_id;
-          const customerId = session.metadata.customerId || updatedInvoices?.[0]?.customer_id;
-          const billingMonth = session.metadata.billingMonth;
-
-          if (orgId && customerId && billingMonth) {
-            const invoiceKey = `${customerId}-${billingMonth}`;
-            // Write to the paid_invoices COLUMN — the ledger the frontend actually reads.
-            // (Previously wrote org.settings.paidInvoices, which the app never reads, so a
-            // Stripe payment's paid flag never reached the billing UI — the drift we chased.)
-            const { data: org } = await supabase
-              .from('organizations')
-              .select('paid_invoices')
-              .eq('id', orgId)
-              .single();
-
-            if (org) {
-              const existingPaidInvoices = org.paid_invoices || {};
-              existingPaidInvoices[invoiceKey] = {
-                paid: true,
-                method: 'electronic',
-                source: 'Stripe',
-                paidDate: paidAt,
-                amount: amountPaid,
-              };
-              await supabase
-                .from('organizations')
-                .update({ paid_invoices: existingPaidInvoices })
-                .eq('id', orgId);
-            }
-          }
-
-          console.log(`Invoice ${session.metadata.invoiceNumber} marked as paid in Supabase`);
+          const settled = await settleCheckoutSession({ supabase, session });
+          settledInfo = settled;
+          if (settled.failed) dbFailed = true;
+          // A receipt is owed once per PAYMENT, independent of which delivery (or the
+          // app's settle endpoint) recorded it: skip only when one was already sent.
+          if (settled.receiptRecorded) alreadySettled = true;
         } catch (dbErr) {
-          console.error('Failed to update invoice in Supabase:', dbErr.message);
+          console.error('Failed to record payment in Supabase:', dbErr.message);
+          dbFailed = true;
         }
+      } else {
+        // No database client (env not configured): keep the event retryable rather
+        // than acknowledging a payment nothing recorded.
+        console.error('Supabase not configured — payment not recorded; asking Stripe to redeliver');
+        dbFailed = true;
       }
 
       // Send payment receipt email. For payment-link checkouts the address the customer
       // typed lives in customer_details.email; customer_email is only a prefill (null here),
-      // so receipts silently never sent before.
+      // so receipts silently never sent before. Skipped when the database work failed
+      // (the redelivery sends it once the books are right) and when this payment's
+      // receipt was already sent (payments[pid].receipt on the invoice).
       const receiptEmail = session.customer_details?.email || session.customer_email;
-      if (receiptEmail) {
+      if (receiptEmail && !dbFailed && !alreadySettled) {
         try {
           const amount = (session.amount_total / 100).toFixed(2);
           const customerName = session.metadata?.customerName || 'Valued Customer';
@@ -2065,6 +2036,12 @@ async function handleStripeWebhook(req, res) {
             companyName
           );
           console.log(`Payment receipt email sent to ${receiptEmail}`);
+          // Remember the receipt on the payment (before answering Stripe) so a
+          // redelivery doesn't send another.
+          if (supabase && settledInfo && settledInfo.invoiceIds && settledInfo.invoiceIds.length) {
+            try { await markReceiptSent({ supabase, invoiceId: settledInfo.invoiceIds[0], session }); }
+            catch (e) { console.warn('Receipt marker failed:', e.message); }
+          }
         } catch (emailErr) {
           console.error('Failed to send payment receipt email:', emailErr.message);
           // Don't fail the webhook response for email errors
@@ -2091,6 +2068,12 @@ async function handleStripeWebhook(req, res) {
       console.log(`Unhandled event type: ${event.type}`);
   }
 
+  if (dbFailed) {
+    // Not acknowledged: Stripe retries (with backoff, for up to 3 days) until the
+    // database work completes.
+    console.error(`Webhook ${event.id} (${event.type}): database update incomplete — asking Stripe to redeliver`);
+    return res.status(500).json({ received: false, retry: true });
+  }
   res.json({ received: true });
 }
 
