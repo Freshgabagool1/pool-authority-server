@@ -1709,13 +1709,6 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
       return res.status(400).json({ error: 'Valid amount is required (must be between $0.01 and $999,999.99)' });
     }
 
-    // Invoice emails now use Payment Links (Checkout Sessions expire after 24h — customers
-    // opening an email a day later hit a dead link). When a fresh link replaces an old one
-    // (resend after an adjustment), deactivate the old so a stale total can't be paid.
-    if (deactivateLinkId && /^plink_[A-Za-z0-9]+$/.test(deactivateLinkId)) {
-      try { await stripe.paymentLinks.update(deactivateLinkId, { active: false }); } catch (e) { /* already inactive */ }
-    }
-
     // First create a price
     const price = await stripe.prices.create({
       currency: 'usd',
@@ -1748,9 +1741,36 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
       },
     });
 
+    // Customer emails receive this permanent Pool Authority URL instead of Stripe's
+    // direct URL. If the amount is edited later and Stripe must issue a replacement
+    // link, every older email still resolves through the invoice record to the newest
+    // active link. The opaque plink id is only a lookup token; no customer data is shown.
+    const permanentUrl = `${req.protocol}://${req.get('host')}/pay/invoice/${paymentLink.id}`;
+
+    // For existing invoices, make the new destination durable before retiring the old
+    // Stripe link. This removes the failure window where an email could be sent with a
+    // replacement link but the browser closed before the frontend persisted it.
+    if (supabase && invoiceId && /^[0-9a-f-]{36}$/i.test(invoiceId)) {
+      const { error: invoiceLinkError } = await supabase
+        .from('invoices')
+        .update({ stripe_invoice_id: paymentLink.id, stripe_payment_link: permanentUrl })
+        .eq('id', invoiceId);
+      if (invoiceLinkError) {
+        await stripe.paymentLinks.update(paymentLink.id, { active: false }).catch(() => {});
+        throw new Error(`Could not save replacement payment link: ${invoiceLinkError.message}`);
+      }
+    }
+
+    // A changed amount must retire the stale-total Stripe destination. Older customer
+    // emails remain usable because their permanent URL resolves to the invoice's new id.
+    if (deactivateLinkId && deactivateLinkId !== paymentLink.id && /^plink_[A-Za-z0-9]+$/.test(deactivateLinkId)) {
+      try { await stripe.paymentLinks.update(deactivateLinkId, { active: false }); } catch (e) { /* already inactive */ }
+    }
+
     res.json({
       success: true,
-      paymentUrl: paymentLink.url,
+      paymentUrl: permanentUrl,
+      stripePaymentUrl: paymentLink.url,
       paymentLinkId: paymentLink.id
     });
 
@@ -1761,6 +1781,63 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
       error: 'Failed to create payment link',
       message: safeMessage
     });
+  }
+});
+
+// Permanent customer-facing invoice URL. The URL in an old email never changes;
+// it follows the invoice's current stripe_invoice_id after edits, resends, and reminders.
+app.get('/pay/invoice/:paymentLinkId', async (req, res) => {
+  const { paymentLinkId } = req.params;
+  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId) || !stripe || !supabase) {
+    return res.status(404).send('Payment link not found.');
+  }
+
+  try {
+    const anchor = await stripe.paymentLinks.retrieve(paymentLinkId);
+    const meta = anchor.metadata || {};
+    let rows = [];
+
+    // First match every invoice that originally shared this link (combined statements).
+    const { data: linkedRows } = await supabase
+      .from('invoices')
+      .select('id,status,stripe_invoice_id,stripe_payment_link,updated_at')
+      .eq('stripe_invoice_id', paymentLinkId)
+      .order('updated_at', { ascending: false });
+    rows = linkedRows || [];
+
+    // If this is an older replaced link, its invoice now points at a different plink id.
+    if (!rows.length && meta.invoiceId && /^[0-9a-f-]{36}$/i.test(meta.invoiceId)) {
+      const { data } = await supabase
+        .from('invoices')
+        .select('id,status,stripe_invoice_id,stripe_payment_link,updated_at')
+        .eq('id', meta.invoiceId)
+        .limit(1);
+      rows = data || [];
+    }
+    if (!rows.length && meta.invoiceNumber && meta.customerId) {
+      const { data } = await supabase
+        .from('invoices')
+        .select('id,status,stripe_invoice_id,stripe_payment_link,updated_at')
+        .eq('customer_id', meta.customerId)
+        .eq('invoice_number', meta.invoiceNumber)
+        .order('updated_at', { ascending: false })
+        .limit(1);
+      rows = data || [];
+    }
+
+    if (rows.length && rows.every(row => row.status === 'paid' || row.status === 'void')) {
+      return res.status(200).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Invoice Paid</title></head><body style="font-family:Arial,sans-serif;background:#f1f5f9;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center"><div style="background:white;padding:36px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:420px"><h1 style="color:#166534;font-size:24px">Payment already received</h1><p style="color:#475569">Thank you. This invoice has already been paid.</p></div></body></html>`);
+    }
+
+    const currentId = rows.find(row => /^plink_[A-Za-z0-9]+$/.test(row.stripe_invoice_id || ''))?.stripe_invoice_id || paymentLinkId;
+    const current = currentId === paymentLinkId ? anchor : await stripe.paymentLinks.retrieve(currentId);
+    if (!current.active || !current.url) {
+      return res.status(409).send('This payment link is being updated. Please contact Pool Authority for assistance.');
+    }
+    return res.redirect(303, current.url);
+  } catch (error) {
+    console.error('Permanent invoice link lookup failed:', error.message);
+    return res.status(404).send('Payment link not found. Please contact Pool Authority for assistance.');
   }
 });
 
