@@ -1817,12 +1817,24 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
 // it follows the invoice's current stripe_invoice_id after edits, resends, and reminders.
 app.get('/pay/invoice/:paymentLinkId', async (req, res) => {
   const { paymentLinkId } = req.params;
-  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId) || !stripe || !supabase) {
+  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId) || !stripe) {
     return res.status(404).send('Payment link not found.');
   }
 
   try {
     const anchor = await stripe.paymentLinks.retrieve(paymentLinkId);
+
+    // The normal case is an unpaid invoice whose original link is still current.
+    // Send the customer straight to Stripe without making the redirect depend on
+    // Supabase response time. Paid links and links superseded after an invoice edit
+    // are deactivated, so those uncommon cases continue through the database lookup
+    // below to show "paid" or locate the replacement destination.
+    if (anchor.active && anchor.url) {
+      return res.redirect(303, anchor.url);
+    }
+    if (!supabase) {
+      return res.status(503).send('This payment link is being updated. Please try again shortly.');
+    }
     const meta = anchor.metadata || {};
     let rows = [];
 
