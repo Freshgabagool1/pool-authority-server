@@ -221,8 +221,31 @@ const buildPaymentButton = (url) => {
   // Softer copy + simpler styling — avoids phishing-trigger words ("Pay Now",
   // "Securely"), emojis in CTAs, and the heavy gradient that some filters flag.
   return `<div style="text-align:center;margin:28px 0;">
-<a href="${url}" target="_blank" style="display:inline-block;background:#2563eb;color:#ffffff;font-size:16px;font-weight:600;padding:14px 36px;border-radius:6px;text-decoration:none;">View invoice and pay</a>
+<a href="${escapeHtml(url)}" target="_blank" style="display:inline-block;background:#2563eb;color:#ffffff;font-size:16px;font-weight:600;padding:14px 36px;border-radius:6px;text-decoration:none;">View invoice and pay</a>
 </div>`;
+};
+
+// Saved templates are user-editable. Some older templates contain a bare
+// {{payment_link}} instead of Markdown such as [Pay]({{payment_link}}). Make both
+// forms produce the same obvious, clickable button. If a customized template has
+// lost the placeholder altogether, append the button so an invoice never goes out
+// without a usable way to pay.
+const ensurePaymentButton = (htmlBody, paymentLink) => {
+  if (!paymentLink) return htmlBody;
+  const escapedLink = escapeHtml(paymentLink);
+  const escapedForRegex = escapedLink.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const button = buildPaymentButton(paymentLink);
+  let replacedAnchor = false;
+  let result = htmlBody.replace(
+    new RegExp(`<a\\s+[^>]*href=["']${escapedForRegex}["'][^>]*>.*?<\\/a>`, 'gi'),
+    () => {
+      replacedAnchor = true;
+      return button;
+    }
+  );
+  if (replacedAnchor) return result;
+  if (result.includes(escapedLink)) return result.replaceAll(escapedLink, button);
+  return `${result}<br><br>${button}`;
 };
 
 // Build photo HTML for embedding in emails
@@ -1447,14 +1470,7 @@ app.post('/send-invoice', rateLimit(10, 60000), authenticateUser, async (req, re
       body += `\n\n[View invoice and pay](${paymentLink})`;
     }
 
-    let htmlBody = textToHtml(body);
-    // Replace any payment link <a> tag with a styled button
-    if (paymentLink) {
-      htmlBody = htmlBody.replace(
-        new RegExp(`<a href="${escapeHtml(paymentLink).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[^<]*</a>`, 'g'),
-        buildPaymentButton(paymentLink)
-      );
-    }
+    const htmlBody = ensurePaymentButton(textToHtml(body), paymentLink);
 
     const finalHtml = buildEmailHtml(htmlBody, companySettings);
     const attachments = attachment ? [{ filename: attachment.filename, content: attachment.content }] : undefined;
@@ -1490,14 +1506,7 @@ app.post('/send-weekly-update', rateLimit(10, 60000), authenticateUser, async (r
       body += `\n\n[View invoice and pay](${paymentLink})`;
     }
 
-    let bodyHtml = textToHtml(body);
-    // Replace any payment link <a> tag with a styled button
-    if (paymentLink) {
-      bodyHtml = bodyHtml.replace(
-        new RegExp(`<a href="${escapeHtml(paymentLink).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^>]*>[^<]*</a>`, 'g'),
-        buildPaymentButton(paymentLink)
-      );
-    }
+    let bodyHtml = ensurePaymentButton(textToHtml(body), paymentLink);
 
     bodyHtml += buildPhotosHtml(data?.photo_urls);
     const htmlBody = buildEmailHtml(bodyHtml, companySettings);
