@@ -26,6 +26,26 @@ if (!stripe) {
   console.warn('WARNING: STRIPE_SECRET_KEY not set. Payment features will be disabled.');
 }
 
+// A Payment Link can create a new Checkout Session every time it is opened. Looking
+// only at the newest 20 sessions can therefore hide an older successful payment behind
+// later unpaid opens. Page through the link's sessions so reconciliation is exhaustive.
+async function listPaymentLinkCheckoutSessions(paymentLinkId, { stopAfterPaid = false, maxSessions = 500 } = {}) {
+  const sessions = [];
+  let startingAfter;
+  while (sessions.length < maxSessions) {
+    const params = {
+      payment_link: paymentLinkId,
+      limit: Math.min(100, maxSessions - sessions.length),
+    };
+    if (startingAfter) params.starting_after = startingAfter;
+    const page = await stripe.checkout.sessions.list(params);
+    sessions.push(...page.data);
+    if ((stopAfterPaid && page.data.some(s => s.payment_status === 'paid')) || !page.has_more || page.data.length === 0) break;
+    startingAfter = page.data[page.data.length - 1].id;
+  }
+  return sessions;
+}
+
 // Supabase client with service role key (for auto-import writes)
 const supabaseUrl = process.env.SUPABASE_URL;
 if (!supabaseUrl) {
@@ -1856,8 +1876,8 @@ app.post('/api/settle-payment', authenticateUser, async (req, res) => {
     if (!stripe) return res.status(503).json({ error: 'Stripe not configured' });
     let sessions = [];
     if (sessionId.startsWith('plink_')) {
-      const list = await stripe.checkout.sessions.list({ payment_link: sessionId, limit: 20 });
-      sessions = list.data.filter(s => s.payment_status === 'paid'); // every paid checkout, oldest last
+      const allSessions = await listPaymentLinkCheckoutSessions(sessionId);
+      sessions = allSessions.filter(s => s.payment_status === 'paid'); // every paid checkout, oldest last
     } else {
       const s = await stripe.checkout.sessions.retrieve(sessionId);
       if (s && s.payment_status === 'paid') sessions = [s];
@@ -1896,12 +1916,9 @@ app.get('/api/payment-status/:sessionId', optionalAuth, async (req, res) => {
     // unpaid session, so limit:1 (newest) hid the paid session behind any later click —
     // which is exactly how combined-statement payments went undetected.
     if (sessionId.startsWith('plink_')) {
-      const sessions = await stripe.checkout.sessions.list({
-        payment_link: sessionId,
-        limit: 20,
-      });
-      const paid = sessions.data.find(s => s.payment_status === 'paid');
-      const session = paid || sessions.data[0];
+      const sessions = await listPaymentLinkCheckoutSessions(sessionId, { stopAfterPaid: true });
+      const paid = sessions.find(s => s.payment_status === 'paid');
+      const session = paid || sessions[0];
       if (session) {
         return res.json({
           success: true,
@@ -1960,12 +1977,9 @@ app.get('/api/payment-link-by-url', optionalAuth, async (req, res) => {
       if (++scanned >= 500) break;
     }
     if (!match) return res.json({ success: true, found: false });
-    const sessions = await stripe.checkout.sessions.list({
-      payment_link: match.id,
-      limit: 20,
-    });
-    const paid = sessions.data.find(s => s.payment_status === 'paid');
-    const session = paid || sessions.data[0];
+    const sessions = await listPaymentLinkCheckoutSessions(match.id, { stopAfterPaid: true });
+    const paid = sessions.find(s => s.payment_status === 'paid');
+    const session = paid || sessions[0];
     return res.json({
       success: true,
       found: true,
