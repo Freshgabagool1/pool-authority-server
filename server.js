@@ -157,6 +157,17 @@ setInterval(() => {
 const paymentSessions = new Map();
 // Short code -> payment URL mapping for short links
 const shortLinks = new Map();
+// Host customers see in payment links. Set PUBLIC_PAY_BASE_URL (e.g.
+// https://pay.poolauthoritycny.com) once that domain points at this service; until
+// then links use whatever host the API was called on.
+const publicPayBase = (req) => {
+  const configured = (process.env.PUBLIC_PAY_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (/^https?:\/\/[^\s/]+$/.test(configured)) return configured;
+  return `${req.protocol}://${req.get('host')}`;
+};
+if (process.env.PUBLIC_PAY_BASE_URL && !/^https?:\/\/[^\s/]+\/*$/.test(process.env.PUBLIC_PAY_BASE_URL.trim())) {
+  console.warn(`PUBLIC_PAY_BASE_URL "${process.env.PUBLIC_PAY_BASE_URL}" is not a bare https://host — ignored; payment links will use the request host.`);
+}
 const generateShortCode = () => {
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
   let code = '';
@@ -1619,20 +1630,19 @@ app.post('/api/create-checkout-session', authenticateUser, async (req, res) => {
       },
     });
 
-    // Generate short link
-    const shortCode = generateShortCode();
-    const serverOriginForLink = `${req.protocol}://${req.get('host')}`;
-    const shortUrl = `${serverOriginForLink}/pay/${shortCode}`;
-    shortLinks.set(shortCode, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
-
-    // Persist short link to Supabase for durability across server restarts
-    // 1. Store in dedicated short_links table (primary — always works)
+    // Generate short link — INSERT with regenerate-on-conflict, same as /api/create-payment-link
+    let shortCode = generateShortCode();
     if (supabase) {
-      supabase.from('short_links')
-        .upsert({ code: shortCode, payment_link_id: paymentLink.id, payment_url: paymentLink.url, created_at: new Date().toISOString() })
-        .then(() => {})
-        .catch(e => console.error('Short link persist error:', e));
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const { error: codeErr } = await supabase.from('short_links')
+          .insert({ code: shortCode, payment_link_id: paymentLink.id, payment_url: paymentLink.url, created_at: new Date().toISOString() });
+        if (!codeErr) break;
+        if (codeErr.code !== '23505') { console.error('Short link persist error:', codeErr.message); break; }
+        shortCode = generateShortCode();
+      }
     }
+    const shortUrl = `${publicPayBase(req)}/${shortCode}`;
+    shortLinks.set(shortCode, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
     // 2. Also update invoices table if invoice row exists (best effort)
     if (supabase && invoiceNumber) {
       supabase.from('invoices')
@@ -1770,11 +1780,31 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
       },
     });
 
-    // Customer emails receive this permanent Pool Authority URL instead of Stripe's
-    // direct URL. If the amount is edited later and Stripe must issue a replacement
-    // link, every older email still resolves through the invoice record to the newest
-    // active link. The opaque plink id is only a lookup token; no customer data is shown.
-    const permanentUrl = `${req.protocol}://${req.get('host')}/pay/invoice/${paymentLink.id}`;
+    // Customer emails receive a short permanent Pool Authority URL instead of Stripe's
+    // direct URL: <pay base>/<8-char code>. The code maps to this Stripe link; if the
+    // amount is edited later and a replacement link is issued, the code still resolves
+    // through the invoice record to the newest active link (resolveInvoiceDestination).
+    // PUBLIC_PAY_BASE_URL (e.g. https://pay.poolauthoritycny.com) brands the host;
+    // without it the server's own origin is used.
+    const payBase = publicPayBase(req);
+    let permanentUrl = `${payBase}/pay/invoice/${paymentLink.id}`; // works with no database at all
+    if (supabase) {
+      // INSERT, never upsert: a (vanishingly rare) code collision must not overwrite
+      // another customer's code. Regenerate on conflict; fall back to the plink form
+      // if the table is unavailable — the link must never be emailed un-persisted.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const shortCode = generateShortCode();
+        const { error: codeErr } = await supabase
+          .from('short_links')
+          .insert({ code: shortCode, payment_link_id: paymentLink.id, payment_url: paymentLink.url, created_at: new Date().toISOString() });
+        if (!codeErr) {
+          permanentUrl = `${payBase}/${shortCode}`;
+          shortLinks.set(shortCode, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
+          break;
+        }
+        if (codeErr.code !== '23505') { console.error('Short link persist error:', codeErr.message); break; }
+      }
+    }
 
     // For existing invoices, make the new destination durable before retiring the old
     // Stripe link. This removes the failure window where an email could be sent with a
@@ -1813,28 +1843,31 @@ app.post('/api/create-payment-link', authenticateUser, async (req, res) => {
   }
 });
 
-// Permanent customer-facing invoice URL. The URL in an old email never changes;
-// it follows the invoice's current stripe_invoice_id after edits, resends, and reminders.
-app.get('/pay/invoice/:paymentLinkId', async (req, res) => {
-  const { paymentLinkId } = req.params;
-  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId) || !stripe) {
-    return res.status(404).send('Payment link not found.');
-  }
-
+// Where a customer-facing link should send the customer today. Shared by the short
+// code routes and the older /pay/invoice/<plink> form. The URL in an old email never
+// changes; it follows the invoice's current stripe_invoice_id after edits, resends,
+// and reminders. Returns { kind: 'redirect', url } | { kind: 'paid' } |
+// { kind: 'updating' } | { kind: 'notfound' }.
+const PAID_PAGE = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Invoice Paid</title></head><body style="font-family:Arial,sans-serif;background:#f1f5f9;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center"><div style="background:white;padding:36px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:420px"><h1 style="color:#166534;font-size:24px">Payment already received</h1><p style="color:#475569">Thank you. This invoice has already been paid.</p></div></body></html>`;
+const sendDestination = (res, dest) => {
+  if (dest.kind === 'redirect') return res.redirect(303, dest.url);
+  if (dest.kind === 'paid') return res.status(200).send(PAID_PAGE);
+  if (dest.kind === 'updating') return res.status(409).send('This payment link is being updated. Please contact Pool Authority for assistance.');
+  return res.status(404).send('Payment link not found. Please contact Pool Authority for assistance.');
+};
+async function resolveInvoiceDestination(paymentLinkId) {
+  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId) || !stripe) return { kind: 'notfound' };
+  let anchor;
+  try { anchor = await stripe.paymentLinks.retrieve(paymentLinkId); }
+  catch (e) { console.error('Payment link retrieve failed:', e.message); return { kind: 'notfound' }; }
   try {
-    const anchor = await stripe.paymentLinks.retrieve(paymentLinkId);
-
     // The normal case is an unpaid invoice whose original link is still current.
     // Send the customer straight to Stripe without making the redirect depend on
     // Supabase response time. Paid links and links superseded after an invoice edit
     // are deactivated, so those uncommon cases continue through the database lookup
     // below to show "paid" or locate the replacement destination.
-    if (anchor.active && anchor.url) {
-      return res.redirect(303, anchor.url);
-    }
-    if (!supabase) {
-      return res.status(503).send('This payment link is being updated. Please try again shortly.');
-    }
+    if (anchor.active && anchor.url) return { kind: 'redirect', url: anchor.url };
+    if (!supabase) return { kind: 'updating' };
     const meta = anchor.metadata || {};
     let rows = [];
 
@@ -1866,20 +1899,23 @@ app.get('/pay/invoice/:paymentLinkId', async (req, res) => {
       rows = data || [];
     }
 
-    if (rows.length && rows.every(row => row.status === 'paid' || row.status === 'void')) {
-      return res.status(200).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Invoice Paid</title></head><body style="font-family:Arial,sans-serif;background:#f1f5f9;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center"><div style="background:white;padding:36px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:420px"><h1 style="color:#166534;font-size:24px">Payment already received</h1><p style="color:#475569">Thank you. This invoice has already been paid.</p></div></body></html>`);
-    }
+    if (rows.length && rows.every(row => row.status === 'paid' || row.status === 'void')) return { kind: 'paid' };
 
     const currentId = rows.find(row => /^plink_[A-Za-z0-9]+$/.test(row.stripe_invoice_id || ''))?.stripe_invoice_id || paymentLinkId;
     const current = currentId === paymentLinkId ? anchor : await stripe.paymentLinks.retrieve(currentId);
-    if (!current.active || !current.url) {
-      return res.status(409).send('This payment link is being updated. Please contact Pool Authority for assistance.');
-    }
-    return res.redirect(303, current.url);
+    if (!current.active || !current.url) return { kind: 'updating' };
+    return { kind: 'redirect', url: current.url };
   } catch (error) {
     console.error('Permanent invoice link lookup failed:', error.message);
-    return res.status(404).send('Payment link not found. Please contact Pool Authority for assistance.');
+    return { kind: 'notfound' };
   }
+}
+
+// Older emails carry /pay/invoice/<plink>; they keep working forever.
+app.get('/pay/invoice/:paymentLinkId', async (req, res) => {
+  const { paymentLinkId } = req.params;
+  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId)) return res.status(404).send('Payment link not found.');
+  return sendDestination(res, await resolveInvoiceDestination(paymentLinkId));
 });
 
 // Settle whatever has been PAID on a payment link or checkout session, using the same
@@ -2358,7 +2394,10 @@ poll();setInterval(poll,12000);
 </body></html>`);
 });
 
-app.get('/pay/:code', async (req, res) => {
+// Short customer-facing links: <pay base>/<code> (new) and /pay/<code> (older emails).
+// The code maps to the Stripe link it was minted for and, through the invoice record,
+// to whatever link is current now — so an old email never dead-ends after an edit.
+const handleShortCode = async (req, res) => {
   const { code } = req.params;
 
   // Codes are exactly 8 alphanumerics (generateShortCode). Reject anything else BEFORE any
@@ -2368,42 +2407,36 @@ app.get('/pay/:code', async (req, res) => {
     return res.status(404).send('Invalid or expired payment link.');
   }
 
-  // Check in-memory cache first
+  // Primary: the short_links table (persisted at creation) → current destination.
+  // The in-memory cache only supplies the link id; the destination is always resolved
+  // live so a replaced or paid link is never served from a stale cached URL.
   const cached = shortLinks.get(code);
-  if (cached?.paymentUrl) {
-    return res.redirect(303, cached.paymentUrl);
-  }
-
-  // Fallback 1: look up in short_links table (reliable — persisted at creation time)
-  if (supabase) {
+  let linkId = cached?.paymentLinkId || null;
+  if (!linkId && supabase) {
     try {
       const { data: linkData } = await supabase
         .from('short_links')
         .select('payment_link_id, payment_url')
         .eq('code', code)
         .limit(1)
-        .single();
-
-      if (linkData?.payment_link_id) {
-        try {
-          const paymentLink = await stripe.paymentLinks.retrieve(linkData.payment_link_id);
-          if (paymentLink?.url && paymentLink.active) {
-            shortLinks.set(code, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
-            return res.redirect(303, paymentLink.url);
-          }
-        } catch (plErr) {
-          console.error('Short link - payment link inactive or invalid:', plErr.message);
-        }
-      }
+        .maybeSingle();
+      if (linkData?.payment_link_id) linkId = linkData.payment_link_id;
     } catch (e) {
       // Table may not exist yet or no match — fall through to invoices lookup
     }
   }
+  if (linkId) {
+    const dest = await resolveInvoiceDestination(linkId);
+    if (dest.kind !== 'notfound') {
+      if (dest.kind === 'redirect') shortLinks.set(code, { paymentUrl: dest.url, paymentLinkId: linkId, createdAt: new Date().toISOString() });
+      return sendDestination(res, dest);
+    }
+  }
 
-  // Fallback 2: look up in invoices table by short URL pattern (legacy)
+  // Fallback: look up in invoices table by the URL stored on the invoice (legacy rows)
   if (supabase) {
     try {
-      const shortUrl = `%/pay/${code}`;
+      const shortUrl = `%/${code}`;
       const { data } = await supabase
         .from('invoices')
         .select('stripe_payment_link, stripe_invoice_id')
@@ -2440,7 +2473,11 @@ app.get('/pay/:code', async (req, res) => {
 .card{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:400px}
 h1{color:#1e3a5f;font-size:20px}p{color:#64748b;font-size:14px}</style></head>
 <body><div class="card"><h1>Payment Link Not Found</h1><p>This payment link is no longer active. Please contact your pool service provider for a new link.</p></div></body></html>`);
-});
+};
+app.get('/pay/:code', handleShortCode);
+// Root form, e.g. https://pay.poolauthoritycny.com/Ab3kR9xZ — the pattern keeps every
+// other route (/api/…, /payment-success, /pay/…) out of this handler.
+app.get('/:code([A-Za-z0-9]{8})', handleShortCode);
 
 // Payment success page — customers are redirected here after paying via Stripe
 app.get('/payment-success', async (req, res) => {
