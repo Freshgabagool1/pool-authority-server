@@ -278,7 +278,10 @@ const buildPhotosHtml = (photoUrls) => {
 const buildEmailHtml = (bodyContent, companySettings) => {
   const companyName = escapeHtml(companySettings?.companyName || 'Pool Authority');
   const companyPhone = escapeHtml(companySettings?.phone || '');
-  const companyEmail = escapeHtml(companySettings?.email || EMAIL_FROM);
+  // Footer shows the company's contact address, else the bare From address — never the
+  // "Name <address>" form (it printed literally in every customer email).
+  const fromBare = (EMAIL_FROM.match(/<([^>]+)>/) || [null, EMAIL_FROM])[1];
+  const companyEmail = escapeHtml(companySettings?.email || fromBare);
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
