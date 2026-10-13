@@ -2701,10 +2701,13 @@ const verifySvixSignature = (req) => {
 
 const RESEND_EVENT_STATE = {
   'email.bounced': 'bounced',
+  'email.failed': 'bounced',          // Resend could not send at all (e.g. invalid address)
   'email.complained': 'complained',
   'email.delivery_delayed': 'delayed',
   'email.delivered': 'delivered',
 };
+// ilike treats % and _ as wildcards — an address is a literal, not a pattern.
+const ilikeLiteral = (s) => String(s).replace(/[\\%_]/g, '\\$&');
 
 async function handleResendWebhook(req, res) {
   const check = verifySvixSignature(req);
@@ -2725,6 +2728,7 @@ async function handleResendWebhook(req, res) {
   const at = event.created_at || new Date().toISOString();
   const detail = d.bounce
     ? [d.bounce.type, d.bounce.subType, d.bounce.message].filter(Boolean).join(' — ')
+    : type === 'email.failed' ? (d.failed && d.failed.reason ? `Send failed — ${d.failed.reason}` : 'Send failed')
     : type === 'email.complained' ? 'Recipient reported the email as spam'
     : type === 'email.delivery_delayed' ? 'Delivery delayed by the recipient mail server'
     : '';
@@ -2732,7 +2736,7 @@ async function handleResendWebhook(req, res) {
   for (const to of recipients) {
     try {
       // The customer record: tags.emailStatus is what the app shows and warns on.
-      const { data: custs, error: custErr } = await supabase.from('customers').select('id, tags').ilike('email', to);
+      const { data: custs, error: custErr } = await supabase.from('customers').select('id, tags').ilike('email', ilikeLiteral(to));
       if (custErr) throw custErr;
       for (const c of custs || []) {
         const tags = { ...(c.tags || {}) };
@@ -2753,7 +2757,7 @@ async function handleResendWebhook(req, res) {
         // Mark the most recent send to this address in the app's email log.
         const since = new Date(Date.now() - 7 * 86400000).toISOString();
         const { data: logs } = await supabase.from('email_log').select('id, metadata')
-          .ilike('recipient_email', to).gte('created_at', since).order('created_at', { ascending: false }).limit(1);
+          .ilike('recipient_email', ilikeLiteral(to)).gte('created_at', since).order('created_at', { ascending: false }).limit(1);
         if (logs && logs[0]) {
           await supabase.from('email_log').update({ status: state, metadata: { ...(logs[0].metadata || {}), deliveryEvent: { type, at, detail } } }).eq('id', logs[0].id);
         }
