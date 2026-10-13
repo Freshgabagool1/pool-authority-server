@@ -79,6 +79,8 @@ app.use(cors({
 // Webhook route MUST be before express.json() to get raw body
 // ============================================================
 app.post('/api/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
+// Resend delivery events (bounces, spam complaints, delays). Raw body for signature checks.
+app.post('/api/webhooks/resend', express.raw({ type: 'application/json' }), handleResendWebhook);
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -2672,6 +2674,98 @@ process.on('uncaughtException', (err) => {
 
 // Start server
 const PORT = process.env.PORT || 3001;
+// ============================================================
+// Resend delivery webhook — bounces and spam complaints flag the customer's email
+// ============================================================
+// Resend signs webhooks with Svix: HMAC-SHA256 over "<svix-id>.<svix-timestamp>.<raw body>"
+// using the base64 secret after "whsec_", sent as "v1,<base64 sig>" (space-separated list).
+const verifySvixSignature = (req) => {
+  const secret = process.env.RESEND_WEBHOOK_SECRET;
+  if (!secret) return { ok: false, reason: 'RESEND_WEBHOOK_SECRET not set' };
+  const id = req.headers['svix-id'];
+  const ts = req.headers['svix-timestamp'];
+  const sigHeader = req.headers['svix-signature'];
+  if (!id || !ts || !sigHeader) return { ok: false, reason: 'missing svix headers' };
+  if (!/^\d+$/.test(String(ts)) || Math.abs(Date.now() / 1000 - Number(ts)) > 300) return { ok: false, reason: 'timestamp outside tolerance' };
+  const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : String(req.body || '');
+  const key = Buffer.from(String(secret).replace(/^whsec_/, ''), 'base64');
+  const expected = crypto.createHmac('sha256', key).update(`${id}.${ts}.${raw}`).digest('base64');
+  const ok = String(sigHeader).split(' ').some(part => {
+    const [version, sig] = part.split(',');
+    if (version !== 'v1' || !sig) return false;
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+  return ok ? { ok: true } : { ok: false, reason: 'signature mismatch' };
+};
+
+const RESEND_EVENT_STATE = {
+  'email.bounced': 'bounced',
+  'email.complained': 'complained',
+  'email.delivery_delayed': 'delayed',
+  'email.delivered': 'delivered',
+};
+
+async function handleResendWebhook(req, res) {
+  const check = verifySvixSignature(req);
+  if (!check.ok) {
+    console.error('Resend webhook rejected:', check.reason);
+    return res.status(400).json({ error: check.reason });
+  }
+  let event;
+  try { event = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body); }
+  catch { return res.status(400).json({ error: 'Invalid JSON' }); }
+
+  const type = event.type || '';
+  const state = RESEND_EVENT_STATE[type];
+  const d = event.data || {};
+  const recipients = (Array.isArray(d.to) ? d.to : [d.to]).filter(Boolean).map(e => String(e).trim().toLowerCase());
+  if (!state || !supabase || recipients.length === 0) return res.json({ received: true, ignored: true });
+
+  const at = event.created_at || new Date().toISOString();
+  const detail = d.bounce
+    ? [d.bounce.type, d.bounce.subType, d.bounce.message].filter(Boolean).join(' — ')
+    : type === 'email.complained' ? 'Recipient reported the email as spam'
+    : type === 'email.delivery_delayed' ? 'Delivery delayed by the recipient mail server'
+    : '';
+
+  for (const to of recipients) {
+    try {
+      // The customer record: tags.emailStatus is what the app shows and warns on.
+      const { data: custs, error: custErr } = await supabase.from('customers').select('id, tags').ilike('email', to);
+      if (custErr) throw custErr;
+      for (const c of custs || []) {
+        const tags = { ...(c.tags || {}) };
+        const prev = tags.emailStatus || null;
+        if (state === 'delivered') {
+          // A delay that later delivers clears itself; a bounce or complaint stays
+          // until the address is changed in the app.
+          if (!(prev && prev.state === 'delayed')) continue;
+          delete tags.emailStatus;
+        } else {
+          if (prev && (prev.state === 'bounced' || prev.state === 'complained') && state === 'delayed') continue;
+          tags.emailStatus = { state, at, detail, subject: d.subject || '', emailId: d.email_id || '' };
+        }
+        const { error: upErr } = await supabase.from('customers').update({ tags, updated_at: new Date().toISOString() }).eq('id', c.id);
+        if (upErr) throw upErr;
+      }
+      if (state !== 'delivered') {
+        // Mark the most recent send to this address in the app's email log.
+        const since = new Date(Date.now() - 7 * 86400000).toISOString();
+        const { data: logs } = await supabase.from('email_log').select('id, metadata')
+          .ilike('recipient_email', to).gte('created_at', since).order('created_at', { ascending: false }).limit(1);
+        if (logs && logs[0]) {
+          await supabase.from('email_log').update({ status: state, metadata: { ...(logs[0].metadata || {}), deliveryEvent: { type, at, detail } } }).eq('id', logs[0].id);
+        }
+      }
+    } catch (e) {
+      console.error(`Resend webhook: could not record ${type} for ${to}:`, e.message);
+    }
+  }
+  console.log(`Resend ${type}: ${recipients.join(', ')}${detail ? ' — ' + detail : ''}`);
+  res.json({ received: true });
+}
+
 app.listen(PORT, () => {
   console.log(`
 🏊 Pool Authority Payment Server
