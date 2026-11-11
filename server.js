@@ -407,6 +407,24 @@ const categorizePool360Item = (description) => {
   return 'chemical';
 };
 
+const categorizeWearSubtype = (description) => {
+  const value = String(description || '').toLowerCase();
+  if (/pump|filter|heater|cleaner|robot|automation|controller|motor|salt cell|light\b|blower|generator/.test(value)) return 'equipment';
+  if (/o-?ring|gasket|seal|plug|basket|fitting|valve|impeller|cartridge|lateral|clamp|union|coupling|elbow|gauge|capacitor|diffuser|bearing/.test(value)) return 'part';
+  if (/brush|net|leaf rake|pole|hose|vac head|test kit|reagent|test strip|thermometer|skimmer sock/.test(value)) return 'supply';
+  return 'wear_item';
+};
+
+const categorizeChemicalCategory = (description) => {
+  const value = String(description || '').toLowerCase();
+  if (/chlor|shock|cal[- ]?hypo|dichlor|trichlor|brom/.test(value)) return 'sanitizer';
+  if (/acid|alkalinity|bicarb|soda ash|ph (?:up|down)|calcium|hardness|stabilizer|cyanur/.test(value)) return 'water_balance';
+  if (/algaecide|phosphate|clarifier|enzyme|metal|stain|scale/.test(value)) return 'specialty';
+  if (/salt/.test(value)) return 'salt';
+  if (/antifreeze|winter/.test(value)) return 'winterizing';
+  return 'other';
+};
+
 const detectPool360Unit = (description, unitOfMeasure) => {
   const desc = description.toUpperCase();
   const multiLbMatch = desc.match(/(\d+)\s*X\s*(\d+\.?\d*)\s*(?:LB|#)/);
@@ -484,9 +502,10 @@ const buildPool360Item = (productCode, catalogInfo, description, uomMatch, saved
     totalPrice: parseFloat(uomMatch[7]),
     itemName: savedMapping?.itemName || description || catalogInfo || `Product ${productCode}`,
     itemType: autoType,
+    inventoryType: autoType === 'equipment' ? 'equipment' : categorizeWearSubtype(fullText),
     usageUnit: savedMapping?.usageUnit || autoUnit.unit,
     conversionFactor: savedMapping?.conversionFactor || autoUnit.conversionFactor,
-    category: savedMapping?.category || '',
+    category: savedMapping?.category || (autoType === 'chemical' ? categorizeChemicalCategory(fullText) : ''),
   };
 };
 
@@ -662,7 +681,9 @@ app.post('/api/process-pool360', async (req, res) => {
     }
 
     // Dedup check: hash the order and compare against import history
-    const orderStr = parsedItems.map(i => `${i.productCode}:${i.shippedQty}`).sort().join('|');
+    // Include the invoice/header text so a legitimate identical reorder is not mistaken
+    // for the prior order merely because it contains the same SKUs and quantities.
+    const orderStr = `${allRows.slice(0, 30).join('|')}::${parsedItems.map(i => `${i.productCode}:${i.shippedQty}:${i.totalPrice}`).sort().join('|')}`;
     const hashKey = 'p360_' + crypto.createHash('sha256').update(orderStr).digest('hex').slice(0, 12);
     const existingImport = importHistory.find(h => h.hash === hashKey);
     if (existingImport) {
@@ -730,19 +751,40 @@ app.post('/api/process-pool360', async (req, res) => {
         if (existingWear) {
           const existingStock = existingWear.stock_quantity || 0;
           existingWear.stock_quantity = existingStock + actualWearQty;
-          await supabase.from('wear_items').update({
+          let { error: wearUpdateError } = await supabase.from('wear_items').update({
             price: wearCostPerUnit,
             stock_quantity: existingWear.stock_quantity,
             description: `Pool360: ${item.productCode} | ${actualWearQty} ${item.usageUnit}`,
+            item_type: item.inventoryType,
+            unit: item.usageUnit || 'each',
+            product_code: item.productCode,
+            supplier: 'Pool360/SCP',
           }).eq('id', existingWear.id);
+          if (wearUpdateError && /item_type|product_code|wear_items.*unit|wear_items.*supplier|schema cache/i.test(wearUpdateError.message || '')) {
+            ({ error: wearUpdateError } = await supabase.from('wear_items').update({
+              price: wearCostPerUnit, stock_quantity: existingWear.stock_quantity,
+              description: `Pool360: ${item.productCode} | ${actualWearQty} ${item.usageUnit}`,
+            }).eq('id', existingWear.id));
+          }
+          if (wearUpdateError) throw wearUpdateError;
         } else {
-          const { data: insertedWear } = await supabase.from('wear_items').insert({
+          const extendedWearRow = {
             org_id: orgId,
             name: itemName,
             price: wearCostPerUnit,
             stock_quantity: actualWearQty,
             description: `Pool360: ${item.productCode} | ${actualWearQty} ${item.usageUnit}`,
-          }).select().single();
+            item_type: item.inventoryType,
+            unit: item.usageUnit || 'each',
+            product_code: item.productCode,
+            supplier: 'Pool360/SCP',
+          };
+          let { data: insertedWear, error: wearInsertError } = await supabase.from('wear_items').insert(extendedWearRow).select().single();
+          if (wearInsertError && /item_type|product_code|wear_items.*unit|wear_items.*supplier|schema cache/i.test(wearInsertError.message || '')) {
+            const { item_type, unit, product_code, supplier, ...legacyWearRow } = extendedWearRow;
+            ({ data: insertedWear, error: wearInsertError } = await supabase.from('wear_items').insert(legacyWearRow).select().single());
+          }
+          if (wearInsertError) throw wearInsertError;
           if (insertedWear) existingWearItems.push(insertedWear);
         }
         wearCount++;
@@ -751,8 +793,11 @@ app.post('/api/process-pool360', async (req, res) => {
 
     // Record import in history to prevent future duplicates
     const newHistory = [...importHistory, { hash: hashKey, date: new Date().toISOString(), itemCount: parsedItems.length }];
+    // Re-read immediately before the settings write so a payment webhook or frontend
+    // settings change that landed during PDF parsing is not overwritten by this import.
+    const { data: latestOrg } = await supabase.from('organizations').select('settings').eq('id', orgId).single();
     await supabase.from('organizations').update({
-      settings: { ...(org.settings || {}), pool360ImportHistory: newHistory },
+      settings: { ...(latestOrg?.settings || org.settings || {}), pool360ImportHistory: newHistory },
     }).eq('id', orgId);
 
     res.json({
