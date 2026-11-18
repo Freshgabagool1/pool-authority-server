@@ -1,0 +1,20 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');const src=fs.readFileSync(require('path').join(__dirname,'../server.js'),'utf8');
+const a=src.indexOf('const PAID_PAGE ='),b=src.indexOf('// Older emails carry',a),c=src.indexOf('const handleShortCode ='),d=src.indexOf("app.get('/pay/:code'",c);
+let responses=[],stripeResult={active:true,url:'https://buy.stripe.com/test'},stripeError=null;
+const db={from(){const q={select(){return q},eq(){return q},order(){return q},limit(){return q},like(){return q},maybeSingle(){return q},then(ok,bad){return Promise.resolve(responses.shift()||{data:[]}).then(ok,bad)}};return q}};
+const ctx=vm.createContext({console:{error(){}},stripe:{paymentLinks:{retrieve:async()=>{if(stripeError)throw stripeError;return stripeResult}}},supabase:db,shortLinks:new Map()});
+vm.runInContext(src.slice(a,b)+src.slice(c,d)+';globalThis.api={resolveInvoiceDestination,handleShortCode,sendDestination};',ctx);
+const res=()=>({headers:{},statusCode:200,set(k,v){this.headers[k]=v;return this},status(n){this.statusCode=n;return this},send(body){this.body=body;return this},redirect(n,url){this.statusCode=n;this.url=url;return this}});
+(async()=>{
+assert.equal((await ctx.api.resolveInvoiceDestination('plink_abc')).kind,'redirect');
+stripeError={type:'StripeConnectionError'};assert.equal((await ctx.api.resolveInvoiceDestination('plink_abc')).kind,'unavailable');
+stripeError={code:'resource_missing'};assert.equal((await ctx.api.resolveInvoiceDestination('plink_abc')).kind,'notfound');
+stripeError=null;stripeResult={active:false,metadata:{}};responses=[{error:{message:'database unavailable'}}];assert.equal((await ctx.api.resolveInvoiceDestination('plink_abc')).kind,'unavailable');
+responses=[{data:[{status:'paid'}]}];assert.equal((await ctx.api.resolveInvoiceDestination('plink_abc')).kind,'paid');
+responses=[{error:{message:'temporary outage'}},{error:{message:'temporary outage'}}];let r=res();await ctx.api.handleShortCode({params:{code:'abcdefgh'}},r);assert.equal(r.statusCode,503);assert.equal(r.headers['Retry-After'],'5');assert(r.body.includes('does not mean your invoice has expired'));
+responses=[{data:null},{data:null}];r=res();await ctx.api.handleShortCode({params:{code:'abcdefgh'}},r);assert.equal(r.statusCode,404);
+responses=[{data:null},{data:{stripe_invoice_id:'plink_abc'}},{data:[{status:'paid'}]}];r=res();await ctx.api.handleShortCode({params:{code:'abcdefgh'}},r);assert.equal(r.statusCode,200);assert(r.body.includes('already been paid'));
+stripeResult={active:true,url:'https://buy.stripe.com/test'};responses=[{data:{payment_link_id:'plink_abc'}}];r=res();await ctx.api.handleShortCode({params:{code:'abcdefgh'}},r);assert.equal(r.statusCode,303);
+assert(src.includes("res.set('Cache-Control', 'no-store, max-age=0')"));
+console.log('PASS: active/paid/missing links, transient Stripe and database failures, short-code fallback, retry response and no-cache headers.');
+})().catch(e=>{console.error(e);process.exitCode=1});

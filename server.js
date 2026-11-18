@@ -16,6 +16,21 @@ const JSZip = require('jszip');
 const { settleCheckoutSession, markReceiptSent } = require('./lib/settlePayment');
 
 const app = express();
+// Payment destinations can change after an edit or payment. Never cache a redirect
+// or a transient error in browsers, email scanners, or intermediate proxies.
+app.use((req, res, next) => {
+  if (req.method === 'GET' && (/^\/pay\//.test(req.path) || /^\/[A-Za-z0-9]{8}$/.test(req.path))) {
+    res.set('Cache-Control', 'no-store, max-age=0');
+    res.set('Pragma', 'no-cache');
+    const started = Date.now();
+    res.on('finish', () => {
+      if (res.statusCode >= 400) console.warn('Payment page request failed', {
+        path: req.path, status: res.statusCode, durationMs: Date.now() - started,
+      });
+    });
+  }
+  next();
+});
 // Behind Render's proxy: trust it so req.ip is the real client (per-IP rate limits
 // actually work) and req.protocol is https (generated links aren't http://).
 app.set('trust proxy', 1);
@@ -1902,14 +1917,19 @@ const PAID_PAGE = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="
 const sendDestination = (res, dest) => {
   if (dest.kind === 'redirect') return res.redirect(303, dest.url);
   if (dest.kind === 'paid') return res.status(200).send(PAID_PAGE);
+  if (dest.kind === 'unavailable') {
+    res.set('Retry-After', '5');
+    return res.status(503).send('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment page temporarily unavailable</title></head><body style="font-family:Arial,sans-serif;padding:32px;max-width:520px;margin:auto"><h1>Please try again</h1><p>We could not reach the payment service right now. This does not mean your invoice has expired. No payment was submitted by this page.</p><p><a href="" style="display:inline-block;padding:16px;background:#2563eb;color:white">Retry payment page</a></p><p>If this continues, contact Pool Authority and tell us you saw a temporary payment-page error.</p></body></html>');
+  }
   if (dest.kind === 'updating') return res.status(409).send('This payment link is being updated. Please contact Pool Authority for assistance.');
   return res.status(404).send('Payment link not found. Please contact Pool Authority for assistance.');
 };
 async function resolveInvoiceDestination(paymentLinkId) {
-  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId) || !stripe) return { kind: 'notfound' };
+  if (!/^plink_[A-Za-z0-9]+$/.test(paymentLinkId)) return { kind: 'notfound' };
+  if (!stripe) return { kind: 'unavailable' };
   let anchor;
   try { anchor = await stripe.paymentLinks.retrieve(paymentLinkId); }
-  catch (e) { console.error('Payment link retrieve failed:', e.message); return { kind: 'notfound' }; }
+  catch (e) { console.error('Payment link retrieve failed:', paymentLinkId, e.code || e.type); return { kind: e.code === 'resource_missing' ? 'notfound' : 'unavailable' }; }
   try {
     // The normal case is an unpaid invoice whose original link is still current.
     // Send the customer straight to Stripe without making the redirect depend on
@@ -1917,35 +1937,38 @@ async function resolveInvoiceDestination(paymentLinkId) {
     // are deactivated, so those uncommon cases continue through the database lookup
     // below to show "paid" or locate the replacement destination.
     if (anchor.active && anchor.url) return { kind: 'redirect', url: anchor.url };
-    if (!supabase) return { kind: 'updating' };
+    if (!supabase) return { kind: 'unavailable' };
     const meta = anchor.metadata || {};
     let rows = [];
 
     // First match every invoice that originally shared this link (combined statements).
-    const { data: linkedRows } = await supabase
+    const { data: linkedRows, error: linkedError } = await supabase
       .from('invoices')
       .select('id,status,stripe_invoice_id,stripe_payment_link,updated_at')
       .eq('stripe_invoice_id', paymentLinkId)
       .order('updated_at', { ascending: false });
+    if (linkedError) throw linkedError;
     rows = linkedRows || [];
 
     // If this is an older replaced link, its invoice now points at a different plink id.
     if (!rows.length && meta.invoiceId && /^[0-9a-f-]{36}$/i.test(meta.invoiceId)) {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('invoices')
         .select('id,status,stripe_invoice_id,stripe_payment_link,updated_at')
         .eq('id', meta.invoiceId)
         .limit(1);
+      if (error) throw error;
       rows = data || [];
     }
     if (!rows.length && meta.invoiceNumber && meta.customerId) {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('invoices')
         .select('id,status,stripe_invoice_id,stripe_payment_link,updated_at')
         .eq('customer_id', meta.customerId)
         .eq('invoice_number', meta.invoiceNumber)
         .order('updated_at', { ascending: false })
         .limit(1);
+      if (error) throw error;
       rows = data || [];
     }
 
@@ -1957,7 +1980,7 @@ async function resolveInvoiceDestination(paymentLinkId) {
     return { kind: 'redirect', url: current.url };
   } catch (error) {
     console.error('Permanent invoice link lookup failed:', error.message);
-    return { kind: 'notfound' };
+    return { kind: 'unavailable' };
   }
 }
 
@@ -2462,16 +2485,19 @@ const handleShortCode = async (req, res) => {
   // live so a replaced or paid link is never served from a stale cached URL.
   const cached = shortLinks.get(code);
   let linkId = cached?.paymentLinkId || null;
+  let lookupFailed = !supabase;
   if (!linkId && supabase) {
     try {
-      const { data: linkData } = await supabase
+      const { data: linkData, error: linkError } = await supabase
         .from('short_links')
         .select('payment_link_id, payment_url')
         .eq('code', code)
         .limit(1)
         .maybeSingle();
+      if (linkError) lookupFailed = true;
       if (linkData?.payment_link_id) linkId = linkData.payment_link_id;
     } catch (e) {
+      lookupFailed = true;
       // Table may not exist yet or no match — fall through to invoices lookup
     }
   }
@@ -2487,14 +2513,18 @@ const handleShortCode = async (req, res) => {
   if (supabase) {
     try {
       const shortUrl = `%/${code}`;
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('invoices')
         .select('stripe_payment_link, stripe_invoice_id')
         .like('stripe_payment_link', shortUrl)
         .limit(1)
-        .single();
+        .maybeSingle();
+      if (error) lookupFailed = true;
 
       if (data?.stripe_invoice_id) {
+        if (data.stripe_invoice_id.startsWith('plink_')) {
+          return sendDestination(res, await resolveInvoiceDestination(data.stripe_invoice_id));
+        }
         try {
           const paymentLink = await stripe.paymentLinks.retrieve(data.stripe_invoice_id);
           if (paymentLink?.url && paymentLink.active) {
@@ -2514,10 +2544,12 @@ const handleShortCode = async (req, res) => {
         }
       }
     } catch (e) {
+      lookupFailed = true;
       console.error('Short link lookup error:', e.message);
     }
   }
 
+  if (lookupFailed) return sendDestination(res, { kind: 'unavailable' });
   res.status(404).send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Link Not Found</title>
 <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f1f5f9;margin:0}
 .card{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center;max-width:400px}
