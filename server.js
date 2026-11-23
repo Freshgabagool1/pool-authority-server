@@ -76,7 +76,7 @@ const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
   : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:8100', 'https://pool-authority.vercel.app'];
 
-app.use(cors({
+const apiCors = cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (mobile apps, curl, server-to-server)
     if (!origin) return callback(null, true);
@@ -88,7 +88,17 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
   credentials: true,
-}));
+});
+// Customer payment pages are public top-level navigation, not authenticated API
+// calls. Sandboxed viewers can send Origin: null. Do not reject their navigation,
+// and do not grant cross-origin script access or credentials to these pages.
+const isPublicPaymentNavigation = (req) => ['GET', 'HEAD'].includes(req.method) && (
+  /^\/[A-Za-z0-9]{8}\/?$/.test(req.path) ||
+  /^\/pay\/[A-Za-z0-9]{8}\/?$/.test(req.path) ||
+  /^\/pay\/invoice\/plink_[A-Za-z0-9]+\/?$/.test(req.path) ||
+  /^\/payment-(success|cancelled)\/?$/.test(req.path)
+);
+app.use((req, res, next) => isPublicPaymentNavigation(req) ? next() : apiCors(req, res, next));
 
 // ============================================================
 // Webhook route MUST be before express.json() to get raw body
