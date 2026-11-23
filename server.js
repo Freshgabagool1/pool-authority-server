@@ -1638,7 +1638,7 @@ app.get('/', (req, res) => {
   const isLive = process.env.STRIPE_SECRET_KEY?.startsWith('sk_live');
   res.json({
     status: 'Pool Authority Payment Server Running',
-    version: '1.4.0',
+    version: '1.4.1',
     stripe: process.env.STRIPE_SECRET_KEY ? (isLive ? 'connected (live)' : 'connected (test)') : 'not configured',
     email: RESEND_API_KEY ? 'configured' : 'not configured',
     pool360Import: supabase ? 'enabled' : 'disabled',
@@ -1705,19 +1705,24 @@ app.post('/api/create-checkout-session', authenticateUser, async (req, res) => {
       },
     });
 
-    // Generate short link — INSERT with regenerate-on-conflict, same as /api/create-payment-link
-    let shortCode = generateShortCode();
+    // Never return an in-memory-only short URL. Older clients still call this route;
+    // a failed insert previously appeared to work until a restart cleared the cache.
+    let shortCode = null;
+    let shortUrl = `${publicPayBase(req)}/pay/invoice/${paymentLink.id}`;
     if (supabase) {
       for (let attempt = 0; attempt < 3; attempt++) {
+        const candidate = generateShortCode();
         const { error: codeErr } = await supabase.from('short_links')
-          .insert({ code: shortCode, payment_link_id: paymentLink.id, payment_url: paymentLink.url, created_at: new Date().toISOString() });
-        if (!codeErr) break;
+          .insert({ code: candidate, payment_link_id: paymentLink.id, payment_url: paymentLink.url, created_at: new Date().toISOString() });
+        if (!codeErr) {
+          shortCode = candidate;
+          shortUrl = `${publicPayBase(req)}/${candidate}`;
+          shortLinks.set(candidate, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
+          break;
+        }
         if (codeErr.code !== '23505') { console.error('Short link persist error:', codeErr.message); break; }
-        shortCode = generateShortCode();
       }
     }
-    const shortUrl = `${publicPayBase(req)}/${shortCode}`;
-    shortLinks.set(shortCode, { paymentUrl: paymentLink.url, paymentLinkId: paymentLink.id, createdAt: new Date().toISOString() });
     // 2. Also update invoices table if invoice row exists (best effort)
     if (supabase && invoiceNumber) {
       supabase.from('invoices')
